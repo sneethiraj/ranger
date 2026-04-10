@@ -28,7 +28,6 @@ import org.springframework.context.annotation.DependsOn;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.ProviderManager;
 import org.springframework.security.saml2.provider.service.authentication.OpenSaml4AuthenticationProvider;
-import org.springframework.security.saml2.provider.service.registration.InMemoryRelyingPartyRegistrationRepository;
 import org.springframework.security.saml2.provider.service.registration.RelyingPartyRegistration;
 import org.springframework.security.saml2.provider.service.registration.RelyingPartyRegistrationRepository;
 import org.springframework.security.saml2.provider.service.registration.RelyingPartyRegistrations;
@@ -43,7 +42,6 @@ import javax.servlet.FilterConfig;
 import javax.servlet.ServletException;
 import javax.servlet.ServletRequest;
 import javax.servlet.ServletResponse;
-
 import java.io.IOException;
 import java.util.Collections;
 
@@ -104,7 +102,7 @@ public class RangerSaml2Configuration {
         } catch (Exception e) {
             LOG.error("Failed to build SAML relying party registration from metadata URL {}", metadataUrl, e);
 
-            return new InMemoryRelyingPartyRegistrationRepository();
+            return new RangerInMemoryRelyingPartyRegistrationRepository();
         }
     }
 
