@@ -78,7 +78,7 @@ public class RangerSaml2Configuration {
     @Bean
     public RelyingPartyRegistrationRepository rangerSaml2RelyingPartyRegistrationRepository() {
         if (!isSaml2Enabled()) {
-            return new InMemoryRelyingPartyRegistrationRepository();
+            return new InMemoryRelyingPartyRegistrationRepository(Collections.emptyList());
         }
 
         String metadataUrl    = StringUtils.trimToEmpty(PropertiesUtil.getProperty(RangerSaml2Constants.METADATA_URL));
@@ -88,7 +88,7 @@ public class RangerSaml2Configuration {
         if (metadataUrl.isEmpty() || spEntityId.isEmpty()) {
             LOG.error("SAML SSO is enabled but {} and/or {} is not set; no relying party will be registered.", RangerSaml2Constants.METADATA_URL, RangerSaml2Constants.SP_ENTITY_ID);
 
-            return new InMemoryRelyingPartyRegistrationRepository();
+            return new InMemoryRelyingPartyRegistrationRepository(Collections.emptyList());
         }
 
         try {
