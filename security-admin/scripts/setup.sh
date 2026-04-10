@@ -165,6 +165,10 @@ cred_keystore_filename=$(eval echo "$(get_prop 'cred_keystore_filename' $PROPFIL
 sso_enabled=$(get_prop 'sso_enabled' $PROPFILE)
 sso_providerurl=$(get_prop 'sso_providerurl' $PROPFILE)
 sso_publickey=$(get_prop 'sso_publickey' $PROPFILE)
+sso_saml_enabled=$(get_prop 'sso_saml_enabled' $PROPFILE)
+sso_saml_metadata_url=$(get_prop 'sso_saml_metadata_url' $PROPFILE)
+sso_saml_registration_id=$(get_prop 'sso_saml_registration_id' $PROPFILE)
+sso_saml_sp_entity_id=$(get_prop 'sso_saml_sp_entity_id' $PROPFILE)
 RANGER_ADMIN_LOG_DIR=$(eval echo "$(get_prop 'RANGER_ADMIN_LOG_DIR' $PROPFILE)")
 RANGER_ADMIN_LOGBACK_CONF_FILE=$(eval echo "$(get_prop 'RANGER_ADMIN_LOGBACK_CONF_FILE' $PROPFILE)")
 RANGER_PID_DIR_PATH=$(eval echo "$(get_prop 'RANGER_PID_DIR_PATH' $PROPFILE)")
@@ -1003,27 +1007,72 @@ update_properties() {
 
 	if [ "${sso_enabled}" == "true" ]
 	then
-		if [ "${sso_providerurl}" == "" ] || [ "${sso_publickey}" == "" ]
+		if [ "${sso_saml_enabled}" == "" ]
 		then
-			log "[E] Please provide valid values in SSO config properties!";
-			exit 1
+			sso_saml_enabled="false"
 		fi
+		sso_saml_enabled=`echo $sso_saml_enabled | tr '[:upper:]' '[:lower:]'`
+		if [ "${sso_saml_registration_id}" == "" ]
+		then
+			sso_saml_registration_id="keycloak"
+		fi
+
+		if [ "${sso_saml_enabled}" == "true" ]
+		then
+			if [ "${sso_saml_metadata_url}" == "" ] || [ "${sso_saml_sp_entity_id}" == "" ]
+			then
+				log "[E] SAML SSO is enabled: set sso_saml_metadata_url and sso_saml_sp_entity_id in install.properties.";
+				exit 1
+			fi
+			propertyName=ranger.sso.enabled
+			newPropertyValue="${sso_enabled}"
+			updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
+
+			propertyName=ranger.sso.saml.enabled
+			newPropertyValue="true"
+			updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
+
+			propertyName=ranger.sso.saml.metadata.url
+			newPropertyValue="${sso_saml_metadata_url}"
+			updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
+
+			propertyName=ranger.sso.saml.registration.id
+			newPropertyValue="${sso_saml_registration_id}"
+			updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
+
+			propertyName=ranger.sso.saml.sp.entity.id
+			newPropertyValue="${sso_saml_sp_entity_id}"
+			updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
+		else
+			if [ "${sso_providerurl}" == "" ] || [ "${sso_publickey}" == "" ]
+			then
+				log "[E] Please provide valid values in SSO config properties!";
+				exit 1
+			fi
+			propertyName=ranger.sso.enabled
+			newPropertyValue="${sso_enabled}"
+			updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
+
+			propertyName=ranger.sso.saml.enabled
+			newPropertyValue="false"
+			updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
+
+			propertyName=ranger.sso.providerurl
+			newPropertyValue="${sso_providerurl}"
+			updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
+
+			propertyName=ranger.sso.publicKey
+			newPropertyValue="${sso_publickey}"
+			updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
+		fi
+	else
 		propertyName=ranger.sso.enabled
-		newPropertyValue="${sso_enabled}"
+		newPropertyValue="false"
 		updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
-	 
-		propertyName=ranger.sso.providerurl
-		newPropertyValue="${sso_providerurl}"
+
+		propertyName=ranger.sso.saml.enabled
+		newPropertyValue="false"
 		updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
-	 
-		propertyName=ranger.sso.publicKey
-		newPropertyValue="${sso_publickey}"
-		updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
-	 
-	 else
-                propertyName=ranger.sso.enabled
-                newPropertyValue="false"
-                updatePropertyToFilePy $propertyName "${newPropertyValue}" $to_file_ranger
 
 	fi
 	if [ "${javax_net_ssl_keyStore}" != "" ]  && [ "${javax_net_ssl_keyStorePassword}" != "" ]

@@ -270,6 +270,26 @@
 		<name>ranger.sso.browser.useragent</name>
 		<value>Mozilla,chrome</value>
 	</property>
+	<property>
+		<name>ranger.sso.saml.enabled</name>
+		<value>false</value>
+		<description>When true with ranger.sso.enabled, use SAML 2.0 SP login (e.g. Keycloak) instead of JWT/Knox cookie SSO.</description>
+	</property>
+	<property>
+		<name>ranger.sso.saml.metadata.url</name>
+		<value></value>
+		<description>IdP SAML metadata URL, e.g. https://keycloak.example.com/realms/myrealm/protocol/saml/descriptor</description>
+	</property>
+	<property>
+		<name>ranger.sso.saml.registration.id</name>
+		<value>keycloak</value>
+		<description>Registration id for Spring Security SAML (path segment in /saml2/authenticate/{id}).</description>
+	</property>
+	<property>
+		<name>ranger.sso.saml.sp.entity.id</name>
+		<value></value>
+		<description>SP entity ID; must match the SAML client &quot;Client ID&quot; (entity ID) configured in Keycloak.</description>
+	</property>
 	<!-- SSO Properties Ends-->
 	<!-- Trusted header auth properties start -->
 	<property>

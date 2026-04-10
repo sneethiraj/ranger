@@ -566,6 +566,22 @@
 		<name>ranger.sso.query.param.originalurl</name>
 		<value>originalUrl</value>
 	</property>
+	<property>
+		<name>ranger.sso.saml.enabled</name>
+		<value>false</value>
+	</property>
+	<property>
+		<name>ranger.sso.saml.metadata.url</name>
+		<value></value>
+	</property>
+	<property>
+		<name>ranger.sso.saml.registration.id</name>
+		<value>keycloak</value>
+	</property>
+	<property>
+		<name>ranger.sso.saml.sp.entity.id</name>
+		<value></value>
+	</property>
 	 <property>
 		<name>ranger.rest-csrf.enabled</name>
 		<value>true</value>

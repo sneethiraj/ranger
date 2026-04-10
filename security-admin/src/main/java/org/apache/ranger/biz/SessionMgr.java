@@ -107,8 +107,13 @@ public class SessionMgr {
         }
 
         Authentication           authentication = SecurityContextHolder.getContext().getAuthentication();
-        WebAuthenticationDetails details        = (WebAuthenticationDetails) authentication.getDetails();
-        String                   currentLoginId = authentication.getName();
+        WebAuthenticationDetails details        = null;
+
+        if (authentication.getDetails() instanceof WebAuthenticationDetails) {
+            details = (WebAuthenticationDetails) authentication.getDetails();
+        }
+
+        String currentLoginId = authentication.getName();
 
         if (userSession != null) {
             if (validateUserSession(userSession, currentLoginId)) {

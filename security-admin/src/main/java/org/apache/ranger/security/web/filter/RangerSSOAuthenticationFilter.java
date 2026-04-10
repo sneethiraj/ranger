@@ -32,6 +32,8 @@ import org.apache.ranger.common.UserSessionBase;
 import org.apache.ranger.security.context.RangerContextHolder;
 import org.apache.ranger.security.context.RangerSecurityContext;
 import org.apache.ranger.security.handler.RangerAuthenticationProvider;
+import org.apache.ranger.security.saml.RangerSaml2Configuration;
+import org.apache.ranger.security.saml.RangerSaml2Constants;
 import org.apache.ranger.util.RestUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,6 +58,8 @@ import javax.servlet.http.Cookie;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
@@ -179,8 +183,44 @@ public class RangerSSOAuthenticationFilter implements Filter {
             }
         }
 
+        if (isRangerSamlRequestPath(httpRequest)) {
+            filterChain.doFilter(servletRequest, servletResponse);
+
+            return;
+        }
+
         //If sso is enable and request is not for local login and is from browser then it will go inside and try for knox sso authentication
         if (ssoEnabled && !httpRequest.getRequestURI().contains(RestUtil.LOCAL_LOGIN_URL)) {
+            if (RangerSaml2Configuration.isSaml2Enabled() && !isAuthenticated()) {
+                HttpServletResponse httpServletResponse = (HttpServletResponse) servletResponse;
+
+                if (isWebUserAgent(userAgent)) {
+                    String registrationId = PropertiesUtil.getProperty(RangerSaml2Constants.REGISTRATION_ID, "keycloak");
+                    String samlLoginPath  = httpRequest.getContextPath() + "/saml2/authenticate/" + registrationId;
+                    String ajaxRequestHeader = httpRequest.getHeader("X-Requested-With");
+
+                    if ("XMLHttpRequest".equals(ajaxRequestHeader)) {
+                        String ssourl = buildSamlLoginAbsoluteUrl(httpRequest, xForwardedURL, samlLoginPath);
+
+                        LOG.debug("SAML ajax redirect URL = {}", ssourl);
+
+                        httpServletResponse.setHeader("X-Frame-Options", "DENY");
+                        httpServletResponse.setStatus(RangerConstants.SC_AUTHENTICATION_TIMEOUT);
+                        httpServletResponse.setHeader("X-Rngr-Redirect-Url", ssourl);
+                    } else {
+                        LOG.debug("SAML browser redirect to {}", samlLoginPath);
+
+                        httpServletResponse.sendRedirect(samlLoginPath);
+                    }
+
+                    return;
+                }
+
+                filterChain.doFilter(servletRequest, servletResponse);
+
+                return;
+            }
+
             //if jwt properties are loaded and is current not authenticated then it will go for sso authentication
             //Note : Need to remove !isAuthenticated() after knoxsso solve the bug from cross-origin script
             if (jwtProperties != null && !isAuthenticated()) {
@@ -320,6 +360,10 @@ public class RangerSSOAuthenticationFilter implements Filter {
     }
 
     public SSOAuthenticationProperties getJwtProperties() {
+        if (PropertiesUtil.getBooleanProperty(RangerSaml2Constants.ENABLED, false)) {
+            return null;
+        }
+
         String providerUrl = PropertiesUtil.getProperty(JWT_AUTH_PROVIDER_URL);
 
         if (providerUrl != null && PropertiesUtil.getBooleanProperty("ranger.sso.enabled", false)) {
@@ -547,6 +591,35 @@ public class RangerSSOAuthenticationFilter implements Filter {
      * @param request for getting the original request URL
      * @return url to use as login url for redirect
      */
+    private boolean isRangerSamlRequestPath(HttpServletRequest request) {
+        String uri = request.getRequestURI();
+        String cp  = request.getContextPath();
+
+        return uri.startsWith(cp + "/saml2/") || uri.startsWith(cp + "/login/saml2/");
+    }
+
+    private String buildSamlLoginAbsoluteUrl(HttpServletRequest request, String xForwardedURL, String samlLoginPath) {
+        if (StringUtils.trimToNull(xForwardedURL) != null) {
+            try {
+                URL xf = new URL(xForwardedURL);
+                String port = xf.getPort() != -1 ? ":" + xf.getPort() : "";
+
+                return xf.getProtocol() + "://" + xf.getHost() + port + samlLoginPath;
+            } catch (MalformedURLException e) {
+                LOG.debug("xForwardedURL is not a valid URL, falling back to request URL", e);
+            }
+        }
+
+        try {
+            URL base = new URL(request.getRequestURL().toString());
+            String port = base.getPort() != -1 ? ":" + base.getPort() : "";
+
+            return base.getProtocol() + "://" + base.getHost() + port + samlLoginPath;
+        } catch (MalformedURLException e) {
+            return samlLoginPath;
+        }
+    }
+
     protected String constructLoginURLForApi(HttpServletRequest request, String xForwardedURL) {
         String delimiter = "?";
 
