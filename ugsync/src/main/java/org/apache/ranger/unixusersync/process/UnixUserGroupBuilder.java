@@ -100,11 +100,10 @@ public class UnixUserGroupBuilder implements UserGroupSource {
         unixGroupFile         = config.getUnixGroupFile();
         timeout               = config.getUpdateMillisMin();
         enumerateGroupMembers = config.isGroupEnumerateEnabled();
-        validateUserName        = config.isUserNameValidateEnabled(); ;
-        validateGroupName       = config.isGroupNameValidateEnabled() ;
-        regExUserNameValidator  = config.getUserNameValidateRegEx() ;
-        regExGroupNameValidator = config.getGroupNameValidateRegEx(); ;
-
+        validateUserName        = config.isUserNameValidateEnabled();
+        validateGroupName       = config.isGroupNameValidateEnabled();
+        regExUserNameValidator  = config.getUserNameValidateRegEx();
+        regExGroupNameValidator = config.getGroupNameValidateRegEx();
 
         LOG.debug("Minimum UserId: {}, minimum GroupId: {}", minimumUserId, minimumGroupId);
     }
@@ -615,11 +614,12 @@ public class UnixUserGroupBuilder implements UserGroupSource {
             LOG.debug("Done adding extra groups");
         }
     }
+
     private boolean isValidUserName(String aUserName) {
-        return (aUserName != null && aUserName.matches(regExUserNameValidator)) ;
+        return (aUserName != null && aUserName.matches(regExUserNameValidator));
     }
 
     private boolean isValidGroupName(String aGroupName) {
-        return (aGroupName != null && aGroupName.matches(regExGroupNameValidator)) ;
+        return (aGroupName != null && aGroupName.matches(regExGroupNameValidator));
     }
 }
