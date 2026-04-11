@@ -74,7 +74,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
-import java.util.HashSet;
 import java.util.List;
 
 public class RangerSSOAuthenticationFilter implements Filter {
@@ -109,29 +108,14 @@ public class RangerSSOAuthenticationFilter implements Filter {
     @Inject
     public RangerSSOAuthenticationFilter() {
         jwtProperties = getJwtProperties();
+
         loadJwtProperties();
-        init() ;
     }
 
     public RangerSSOAuthenticationFilter(SSOAuthenticationProperties jwtProperties) {
         this.jwtProperties = jwtProperties;
+
         loadJwtProperties();
-        init() ;
-    }
-
-    final String CHROME_UA = "Mozilla/5.0 AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36" ;
-    final HashSet<String> allowedUAList = new HashSet<String>();
-
-    private void init() {
-        if (allowedUAList.isEmpty()) {
-            for (String ua : CHROME_UA.split(" ")) {
-                String[] tokens = ua.split("/");
-                if (tokens.length == 2) {
-                    String ua_name = tokens[0].trim();
-                    allowedUAList.add(ua_name.toLowerCase());
-                }
-            }
-        }
     }
 
     public static RSAPublicKey parseRSAPublicKey(String pem) throws CertificateException, UnsupportedEncodingException, ServletException {
@@ -729,17 +713,6 @@ public class RangerSSOAuthenticationFilter implements Filter {
             if (userAgentList != null) {
                 for (String ua : userAgentList) {
                     if (userAgent.toLowerCase().startsWith(ua.toLowerCase())) {
-                        isWeb = true;
-                        break;
-                    }
-                }
-            }
-        }
-        else {
-            if (userAgent != null) {
-                String browserUserAgent = userAgent.toLowerCase();
-                for (String ua : allowedUAList) {
-                    if (browserUserAgent.startsWith(ua)) {
                         isWeb = true;
                         break;
                     }
