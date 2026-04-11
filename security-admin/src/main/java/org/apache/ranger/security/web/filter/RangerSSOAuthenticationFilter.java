@@ -159,9 +159,12 @@ public class RangerSSOAuthenticationFilter implements Filter {
         HttpServletRequest httpRequest   = (HttpServletRequest) servletRequest;
         String             xForwardedURL = RestUtil.constructForwardableURL(httpRequest);
 
+        LOG.info("RangerSSOAuthenticationFilter.doFilter url: " + ((HttpServletRequest) servletRequest).getRequestURL() + ", uri: " + ((HttpServletRequest) servletRequest).getRequestURI());
+
         if (httpRequest.getRequestedSessionId() != null && !httpRequest.isRequestedSessionIdValid()) {
             synchronized (httpRequest.getServletContext()) {
                 if (httpRequest.getServletContext().getAttribute(httpRequest.getRequestedSessionId()) != null && "locallogin".equals(httpRequest.getServletContext().getAttribute(httpRequest.getRequestedSessionId()).toString())) {
+                    LOG.info("Setting it as locallogin") ;
                     httpRequest.getSession().setAttribute("locallogin", "true");
                     httpRequest.getServletContext().removeAttribute(httpRequest.getRequestedSessionId());
                 }
@@ -173,10 +176,12 @@ public class RangerSSOAuthenticationFilter implements Filter {
         boolean               ssoEnabled = session != null ? session.isSSOEnabled() : PropertiesUtil.getBooleanProperty("ranger.sso.enabled", false);
         String                userAgent  = httpRequest.getHeader("User-Agent");
 
+        LOG.info("Is SSO enabled: " + ssoEnabled);
+
         if (httpRequest.getSession() != null) {
             if (httpRequest.getSession().getAttribute("locallogin") != null) {
+                LOG.info("Setting it as locallogin (1)") ;
                 servletRequest.setAttribute("ssoEnabled", false);
-
                 filterChain.doFilter(servletRequest, servletResponse);
 
                 return;
@@ -184,6 +189,7 @@ public class RangerSSOAuthenticationFilter implements Filter {
         }
 
         if (isRangerSamlRequestPath(httpRequest)) {
+            LOG.info("Matching RangerSaml request .... forwarding to filterchain") ;
             filterChain.doFilter(servletRequest, servletResponse);
 
             return;
@@ -699,6 +705,8 @@ public class RangerSSOAuthenticationFilter implements Filter {
     private boolean isWebUserAgent(String userAgent) {
         boolean isWeb = false;
 
+        LOG.info("IsWebUserAgent: [" + userAgent + "] is being called.");
+
         if (jwtProperties != null) {
             String[] userAgentList = jwtProperties.getUserAgentList();
 
@@ -711,6 +719,8 @@ public class RangerSSOAuthenticationFilter implements Filter {
                 }
             }
         }
+
+        LOG.info("IsWebUserAgent: [" + userAgent + "] is returning [" + isWeb + "].");
 
         return isWeb;
     }

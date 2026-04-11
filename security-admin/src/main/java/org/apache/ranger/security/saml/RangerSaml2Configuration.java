@@ -76,12 +76,15 @@ public class RangerSaml2Configuration {
     @Bean
     public RelyingPartyRegistrationRepository rangerSaml2RelyingPartyRegistrationRepository() {
         if (!isSaml2Enabled()) {
+            LOG.info("SAML is disabled.") ;
             return new RangerInMemoryRelyingPartyRegistrationRepository(Collections.emptyList());
         }
 
         String metadataUrl    = StringUtils.trimToEmpty(PropertiesUtil.getProperty(RangerSaml2Constants.METADATA_URL));
         String spEntityId     = StringUtils.trimToEmpty(PropertiesUtil.getProperty(RangerSaml2Constants.SP_ENTITY_ID));
         String registrationId = StringUtils.trimToEmpty(PropertiesUtil.getProperty(RangerSaml2Constants.REGISTRATION_ID, "keycloak"));
+
+        LOG.info("SAML is enabled with metadata URL: " + metadataUrl + " and registration ID: " + registrationId + "and spEntityId: " + spEntityId);
 
         if (metadataUrl.isEmpty() || spEntityId.isEmpty()) {
             LOG.error("SAML SSO is enabled but {} and/or {} is not set; no relying party will be registered.", RangerSaml2Constants.METADATA_URL, RangerSaml2Constants.SP_ENTITY_ID);
@@ -102,7 +105,7 @@ public class RangerSaml2Configuration {
         } catch (Exception e) {
             LOG.error("Failed to build SAML relying party registration from metadata URL {}", metadataUrl, e);
 
-            return new RangerInMemoryRelyingPartyRegistrationRepository();
+            return new RangerInMemoryRelyingPartyRegistrationRepository(Collections.emptyList());
         }
     }
 
@@ -114,8 +117,7 @@ public class RangerSaml2Configuration {
     @Bean
     public AuthenticationSuccessHandler rangerSamlAuthenticationSuccessHandler() {
         SavedRequestAwareAuthenticationSuccessHandler handler = new SavedRequestAwareAuthenticationSuccessHandler();
-
-        handler.setDefaultTargetUrl("/dashboard.jsp");
+        handler.setDefaultTargetUrl("/index.html");
         handler.setAlwaysUseDefaultTargetUrl(false);
 
         return handler;
