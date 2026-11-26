@@ -27,9 +27,14 @@ Status: early development. Implemented so far:
 - point-in-time feature snapshots, with a SQLite feature store
 - three deterministic detectors: over-privileged grants, stale policies, abnormal access time
 - a replay harness and a synthetic scenario with planted anomalies and ground truth
+- an optional LLM explanation layer: pseudonymized input, strict output validation, deterministic fallback
+- a suggestion store with an append-only, hash-chained action log
+- human approval, guarded apply with read-back verification, and rollback (dry run by default)
+- a command-line workflow and a read-only HTML "AI Insights" report
 
-Not yet implemented: the LLM reasoning layer, suggestion storage, approval and
-rollback, and the UI.
+Not yet implemented: an in-Ranger UI (the report is a standalone file), evaluation of
+group and role grants, and end-to-end testing against a live Ranger and Solr.
+See [docs/design.md](docs/design.md#10-implementation-status) for the full list of gaps.
 
 ## Demo
 

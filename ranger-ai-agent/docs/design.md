@@ -109,24 +109,58 @@ the formula is documented and unit tested.
 
 ## 7. Approval, apply and rollback
 
-- Approve -> re-validate -> snapshot current policy (version N) -> apply ->
-  record suggestion id in the policy change description.
-- Rollback restores the stored snapshot and is itself logged.
-- Safeguards: dry-run default, kill switch, per-day change cap, protected
-  service/policy deny-list, no admin or wildcard grants.
+- Approve (named human) -> re-validate against current protections -> read the
+  live policy and require its version to equal the version the proposal was
+  built from -> PUT the proposed policy -> read it back and check that grants
+  and the enabled flag match -> record the application and move the suggestion
+  to APPLIED, in one transaction.
+- Rollback restores the stored pre-change policy. It is refused if the policy
+  changed since the agent wrote it, and it is blocked while the kill switch is on.
+- Safeguards: dry-run default, kill switch, rolling 24-hour change cap, protected
+  policy list, and no added grants (so no admin or wildcard grants can be introduced).
+- A failed read-back after a write is reported as `VERIFY_FAILED`. The policy is
+  left as written, and a person must inspect it. The next run reports `CONFLICT`
+  because the version has moved.
 
 ## 8. Security and logging
 
-- Append-only action log for every collect, detect, prompt, response,
-  decision and apply, with the model name/version and an evidence hash.
+- Append-only, hash-chained action log for suggestion creation, LLM calls
+  (provider name and SHA-256 of the prompt and of the response; never the raw
+  text), reviews, applies and rollbacks. Editing or deleting entries breaks
+  `verify-log`. Database triggers also reject UPDATE and DELETE.
+- Non-local model endpoints are refused unless `RANGER_AI_ALLOW_EXTERNAL_LLM` is set.
 - Secrets (Ranger password, LLM API keys) come from environment variables or
   the Ranger credential provider, never from plain config files.
 - TLS verification is on by default.
 
 ## 9. Open questions
 
-1. Suggestion store: SQLite for the MVP, pluggable later?
-2. UI path: thin proxy endpoint in security-admin so the browser reuses Ranger
-   authentication?
-3. Packaging: standalone Python service now, optional Maven/distro integration
-   later?
+1. Suggestion store: SQLite is implemented. A pluggable backend is not.
+2. UI path: a standalone read-only HTML report is implemented. A thin proxy
+   endpoint in security-admin, so the browser reuses Ranger authentication, is
+   not. It needs a decision before work starts.
+3. Packaging: still a standalone Python package. Maven or distro integration is open.
+
+## 10. Implementation status
+
+Implemented on `ranger_5278` and covered by unit tests (159 passing), with
+planted-anomaly accuracy measured on synthetic data only:
+
+- read-only Ranger and Solr clients; a GET-only reader and a separate PUT-only writer
+- feature snapshots, feature store, three detectors, replay harness
+- LLM layer: HMAC pseudonyms, strict JSON validation, deterministic fallback, opt-in for remote endpoints
+- suggestion store, validation, human review, guarded apply, rollback
+- command-line workflow and read-only HTML report
+
+Known gaps:
+
+- Not tested against a live Ranger or Solr instance. The write path's assumptions
+  about Ranger's update behavior come from reading the server source, not from a run.
+- Group and role grants are not evaluated. Only direct user grants are checked.
+- The suggestion id is not written into the policy's description, as the apply
+  step above once proposed.
+- Per-policy audit queries run once per policy (N+1), which may be slow on large
+  deployments.
+- No in-Ranger UI. The report is standalone and cannot trigger actions.
+- Synthetic results show that the detectors and workflow behave as designed. They
+  do not show accuracy on real audit data.
