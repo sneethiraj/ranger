@@ -79,11 +79,44 @@ pytest
 | `RANGER_AI_SOLR_URL` | `http://localhost:6083/solr` | Solr base URL |
 | `RANGER_AI_SOLR_COLLECTION` | `ranger_audits` | Audit collection |
 | `RANGER_AI_SOLR_USER` / `RANGER_AI_SOLR_PASSWORD` | unset | Solr basic auth |
-| `RANGER_AI_DRY_RUN` | `true` | Never write to Ranger when true |
-| `RANGER_AI_KILL_SWITCH` | `false` | Disable all agent actions |
+| `RANGER_AI_DRY_RUN` | `true` | Log planned policy changes, never write to Ranger |
+| `RANGER_AI_KILL_SWITCH` | `false` | Stop generating, applying, and rolling back |
+| `RANGER_AI_MAX_CHANGES_PER_DAY` | `5` | Cap on applied changes in a rolling 24-hour window |
+| `RANGER_AI_PROTECTED_POLICY_IDS` | empty | Comma-separated policy IDs the agent must never change |
+| `RANGER_AI_STORE` | `ranger-ai-suggestions.db` | SQLite file for suggestions and the action log |
+| `RANGER_AI_LLM_PROVIDER` | `none` | `none`, `openai` (any OpenAI-compatible endpoint), or `ollama` |
+| `RANGER_AI_LLM_URL` / `RANGER_AI_LLM_MODEL` / `RANGER_AI_LLM_API_KEY` | unset | Model endpoint settings |
+| `RANGER_AI_PSEUDONYM_KEY` | random per process | HMAC key for pseudonyms sent to a model; set it for stable pseudonyms |
+
+## Command line
+
+```
+export PYTHONPATH=src
+python -m ranger_ai_agent.cli suggest --synthetic   # or `suggest` with live Ranger and Solr
+python -m ranger_ai_agent.cli list --status PENDING
+python -m ranger_ai_agent.cli show <id>
+python -m ranger_ai_agent.cli approve <id> --reviewer alice
+python -m ranger_ai_agent.cli apply                 # dry run unless RANGER_AI_DRY_RUN=0
+python -m ranger_ai_agent.cli rollback <id> --requester alice
+python -m ranger_ai_agent.cli verify-log
+```
+
+Reviewer and requester names must identify a person; `agent` is refused.
+Exit codes: `0` success, `1` refused or failed, `2` action log failed verification.
 
 ## Safety
 
-The Ranger and Solr clients are read-only by construction. Nothing in this
-package changes Ranger state; applying approved suggestions will live in a
-separate, approval-gated component.
+- Suggestions are read-only until a person approves them.
+- Proposals are built by deterministic code. A model can explain a finding but
+  cannot change its proposal, status, or confidence.
+- Proposals may remove grants or disable a policy. They may never add grants,
+  re-enable a policy, or change a policy's identity.
+- Before any write, the applier checks the kill switch, the daily cap, the
+  protected-policy list, and that the live policy version is the one the proposal
+  was built from. A mismatch is reported as `CONFLICT` and nothing is written.
+- Every write is read back and checked. Rollback restores the stored pre-change
+  policy and refuses if the policy changed since the agent wrote it.
+- The action log is append-only (database triggers) and hash-chained, so
+  `verify-log` detects edits made around the triggers.
+- The read client is GET-only. Writes go through a separate client that can only
+  update a policy.

@@ -135,6 +135,7 @@ def _raw_policy(
         "id": policy_id,
         "name": name,
         "service": "hive_prod",
+        "version": 1,
         "isEnabled": enabled,
         "createTime": _ms(created),
         "updateTime": _ms(updated),
