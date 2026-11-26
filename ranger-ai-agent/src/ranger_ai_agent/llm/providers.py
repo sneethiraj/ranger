@@ -133,25 +133,43 @@ class OllamaProvider(_HttpProvider):
             raise LLMError("unexpected response shape from model endpoint") from exc
 
 
+ALLOW_EXTERNAL_ENV = "RANGER_AI_ALLOW_EXTERNAL_LLM"
+
+
+def _truthy(value: Optional[str]) -> bool:
+    return value is not None and value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def provider_from_env(environ: Optional[Mapping[str, str]] = None):
     """Return the configured provider, or None when no model is configured.
 
     RANGER_AI_LLM_PROVIDER: none (default), openai, or ollama
     RANGER_AI_LLM_URL, RANGER_AI_LLM_MODEL, RANGER_AI_LLM_API_KEY (openai only)
+
+    A non-local endpoint sends (pseudonymized) finding data off this host, so it
+    is refused unless RANGER_AI_ALLOW_EXTERNAL_LLM is set to a true value.
     """
     env = os.environ if environ is None else environ
     mode = env.get("RANGER_AI_LLM_PROVIDER", "none").strip().lower()
     if mode == "none":
         return None
     if mode == "openai":
-        return OpenAICompatibleProvider(
+        provider = OpenAICompatibleProvider(
             base_url=env.get("RANGER_AI_LLM_URL", ""),
             model=env.get("RANGER_AI_LLM_MODEL", ""),
             api_key=env.get("RANGER_AI_LLM_API_KEY") or None,
         )
-    if mode == "ollama":
-        return OllamaProvider(
+    elif mode == "ollama":
+        provider = OllamaProvider(
             model=env.get("RANGER_AI_LLM_MODEL", ""),
             base_url=env.get("RANGER_AI_LLM_URL", DEFAULT_OLLAMA_URL),
         )
-    raise ValueError("unknown RANGER_AI_LLM_PROVIDER: %r" % mode)
+    else:
+        raise ValueError("unknown RANGER_AI_LLM_PROVIDER: %r" % mode)
+
+    if provider.external and not _truthy(env.get(ALLOW_EXTERNAL_ENV)):
+        raise ValueError(
+            "the model endpoint is not local; set %s=1 to allow sending pseudonymized finding data to it"
+            % ALLOW_EXTERNAL_ENV
+        )
+    return provider

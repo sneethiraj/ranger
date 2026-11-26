@@ -86,6 +86,7 @@ pytest
 | `RANGER_AI_STORE` | `ranger-ai-suggestions.db` | SQLite file for suggestions and the action log |
 | `RANGER_AI_LLM_PROVIDER` | `none` | `none`, `openai` (any OpenAI-compatible endpoint), or `ollama` |
 | `RANGER_AI_LLM_URL` / `RANGER_AI_LLM_MODEL` / `RANGER_AI_LLM_API_KEY` | unset | Model endpoint settings |
+| `RANGER_AI_ALLOW_EXTERNAL_LLM` | `false` | Required to use a non-local model endpoint (pseudonymized data leaves the host) |
 | `RANGER_AI_PSEUDONYM_KEY` | random per process | HMAC key for pseudonyms sent to a model; set it for stable pseudonyms |
 
 ## Command line

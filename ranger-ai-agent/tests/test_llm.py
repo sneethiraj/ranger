@@ -196,3 +196,32 @@ def test_provider_from_env():
         provider_from_env({"RANGER_AI_LLM_PROVIDER": "bogus"})
     with pytest.raises(ValueError, match="model name"):
         provider_from_env({"RANGER_AI_LLM_PROVIDER": "openai", "RANGER_AI_LLM_URL": "http://x"})
+
+
+REMOTE = {
+    "RANGER_AI_LLM_PROVIDER": "openai",
+    "RANGER_AI_LLM_URL": "https://api.example.com/v1",
+    "RANGER_AI_LLM_MODEL": "m",
+}
+
+
+def test_remote_endpoint_is_refused_by_default():
+    with pytest.raises(ValueError, match="RANGER_AI_ALLOW_EXTERNAL_LLM=1"):
+        provider_from_env(REMOTE)
+
+
+def test_remote_endpoint_requires_an_explicit_true_value():
+    for value in ("0", "false", "no", "", "maybe"):
+        with pytest.raises(ValueError):
+            provider_from_env(dict(REMOTE, RANGER_AI_ALLOW_EXTERNAL_LLM=value))
+
+
+def test_remote_endpoint_allowed_when_opted_in():
+    provider = provider_from_env(dict(REMOTE, RANGER_AI_ALLOW_EXTERNAL_LLM="1"))
+    assert provider.external is True
+
+
+def test_local_endpoints_need_no_opt_in():
+    assert provider_from_env({"RANGER_AI_LLM_PROVIDER": "ollama", "RANGER_AI_LLM_MODEL": "llama3"}).external is False
+    local = {"RANGER_AI_LLM_PROVIDER": "openai", "RANGER_AI_LLM_URL": "http://127.0.0.1:8000/v1", "RANGER_AI_LLM_MODEL": "m"}
+    assert provider_from_env(local).external is False
