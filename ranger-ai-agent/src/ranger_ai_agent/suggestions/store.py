@@ -226,6 +226,24 @@ class SuggestionStore:
             "version_after": row[5],
         }
 
+    def list_applications(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT application_id, suggestion_id, policy_id, applied_at, applied_by, version_before, version_after, "
+            "rolled_back_at, rolled_back_by FROM applications ORDER BY application_id"
+        ).fetchall()
+        keys = (
+            "application_id",
+            "suggestion_id",
+            "policy_id",
+            "applied_at",
+            "applied_by",
+            "version_before",
+            "version_after",
+            "rolled_back_at",
+            "rolled_back_by",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
     def count_applications_since(self, since: str) -> int:
         """Applications made at or after `since` (ISO-8601 UTC). Rolled-back changes still count."""
         row = self._conn.execute("SELECT COUNT(*) FROM applications WHERE applied_at >= ?", (since,)).fetchone()

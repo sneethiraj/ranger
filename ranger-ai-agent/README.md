@@ -99,8 +99,12 @@ python -m ranger_ai_agent.cli show <id>
 python -m ranger_ai_agent.cli approve <id> --reviewer alice
 python -m ranger_ai_agent.cli apply                 # dry run unless RANGER_AI_DRY_RUN=0
 python -m ranger_ai_agent.cli rollback <id> --requester alice
+python -m ranger_ai_agent.cli report --output insights.html   # read-only HTML "AI Insights" page
 python -m ranger_ai_agent.cli verify-log
 ```
+
+The report is a single static file with no scripts, forms, or external
+resources. It shows real user names, so treat it as internal.
 
 Reviewer and requester names must identify a person; `agent` is refused.
 Exit codes: `0` success, `1` refused or failed, `2` action log failed verification.

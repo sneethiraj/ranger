@@ -210,3 +210,13 @@ def test_verify_log_passes_then_detects_tampering(store_path, capsys):
 
     assert run(store_path, "verify-log") == 2
     assert "FAILED verification" in capsys.readouterr().err
+
+
+def test_report_writes_a_read_only_page(store_path, tmp_path, capsys):
+    suggest_and_approve(store_path, capsys)
+    target = tmp_path / "insights.html"
+    assert run(store_path, "report", "--output", str(target)) == 0
+    assert "wrote" in capsys.readouterr().out
+    text = target.read_text(encoding="utf-8")
+    assert "Ranger AI Insights" in text
+    assert "<script" not in text.lower()

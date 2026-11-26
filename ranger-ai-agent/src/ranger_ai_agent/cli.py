@@ -20,6 +20,7 @@
     PYTHONPATH=src python -m ranger_ai_agent.cli approve <id> --reviewer alice
     PYTHONPATH=src python -m ranger_ai_agent.cli apply
     PYTHONPATH=src python -m ranger_ai_agent.cli rollback <id> --requester alice
+    PYTHONPATH=src python -m ranger_ai_agent.cli report --output insights.html
     PYTHONPATH=src python -m ranger_ai_agent.cli verify-log
 
 Settings:
@@ -49,6 +50,7 @@ from ranger_ai_agent.detectors import DetectorConfig, run_detectors
 from ranger_ai_agent.features.snapshot import SnapshotBuilder
 from ranger_ai_agent.llm.providers import provider_from_env
 from ranger_ai_agent.models import UTC
+from ranger_ai_agent.report import render_insights
 from ranger_ai_agent.suggestions.apply import Applier
 from ranger_ai_agent.suggestions.service import SuggestionService
 from ranger_ai_agent.suggestions.store import SuggestionStore
@@ -152,6 +154,17 @@ def cmd_rollback(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     return EXIT_OK
 
 
+def cmd_report(args: argparse.Namespace, store: SuggestionStore, out) -> int:
+    page = render_insights(store, SafetyConfig.from_env(), datetime.now(UTC))
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(page)
+        print("wrote %s" % args.output, file=out)
+    else:
+        print(page, file=out)
+    return EXIT_OK
+
+
 def cmd_verify_log(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     entries = len(store.log_entries())
     if store.verify_log():
@@ -191,6 +204,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("suggestion_id")
     p.add_argument("--requester", required=True, help="name of the person requesting the rollback")
     p.set_defaults(handler=cmd_rollback)
+
+    p = sub.add_parser("report", help="write a read-only HTML insights page")
+    p.add_argument("--output", help="file to write (default: standard output)")
+    p.set_defaults(handler=cmd_report)
 
     p = sub.add_parser("verify-log", help="check the action log hash chain")
     p.set_defaults(handler=cmd_verify_log)
