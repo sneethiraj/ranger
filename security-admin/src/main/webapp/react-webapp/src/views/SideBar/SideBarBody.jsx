@@ -626,6 +626,19 @@ export const SideBarBody = (props) => {
                   </NavLink>
                 </li>
               )}
+              {isSystemAdmin() && (
+                <li className="list-group-item">
+                  <NavLink
+                    to="/ai-insights"
+                    onClick={() => {
+                      props.closeCollapse();
+                    }}
+                    className="list-group-item"
+                  >
+                    AI Insights
+                  </NavLink>
+                </li>
+              )}
             </ul>
           </div>
         </div>

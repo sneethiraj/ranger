@@ -31,9 +31,12 @@ Status: early development. Implemented so far:
 - a suggestion store with an append-only, hash-chained action log
 - human approval, guarded apply with read-back verification, and rollback (dry run by default)
 - a command-line workflow and a read-only HTML "AI Insights" report
+- a read-only "AI Insights" page in the Ranger Admin UI for system administrators
+  (see [Viewing the report in Ranger Admin](#viewing-the-report-in-ranger-admin))
 
-Not yet implemented: an in-Ranger UI (the report is a standalone file), evaluation of
-group and role grants, and end-to-end testing against a live Ranger and Solr.
+Not yet implemented: evaluation of group and role grants, and end-to-end testing
+against a live Ranger and Solr. The Ranger Admin page has not been run in a deployed
+Ranger Admin.
 See [docs/design.md](docs/design.md#10-implementation-status) for the full list of gaps.
 
 ## Demo
@@ -93,6 +96,7 @@ pytest
 | `RANGER_AI_LLM_URL` / `RANGER_AI_LLM_MODEL` / `RANGER_AI_LLM_API_KEY` | unset | Model endpoint settings |
 | `RANGER_AI_ALLOW_EXTERNAL_LLM` | `false` | Required to use a non-local model endpoint (pseudonymized data leaves the host) |
 | `RANGER_AI_PSEUDONYM_KEY` | random per process | HMAC key for pseudonyms sent to a model; set it for stable pseudonyms |
+| `RANGER_AI_SERVE_TOKEN` | unset | Bearer token (32+ characters) the `serve` command requires. `serve` refuses to start without it |
 
 ## Command line
 
@@ -106,6 +110,7 @@ python -m ranger_ai_agent.cli apply                 # dry run unless RANGER_AI_D
 python -m ranger_ai_agent.cli rollback <id> --requester alice
 python -m ranger_ai_agent.cli report --output insights.html   # read-only HTML "AI Insights" page
 python -m ranger_ai_agent.cli verify-log
+python -m ranger_ai_agent.cli serve                 # read-only JSON for the Ranger Admin page (needs RANGER_AI_SERVE_TOKEN)
 ```
 
 The report is a single static file with no scripts, forms, or external
@@ -113,6 +118,37 @@ resources. It shows real user names, so treat it as internal.
 
 Reviewer and requester names must identify a person; `agent` is refused.
 Exit codes: `0` success, `1` refused or failed, `2` action log failed verification.
+
+## Viewing the report in Ranger Admin
+
+System administrators can see the report under **Settings > AI Insights** in the
+Ranger Admin UI. The page is read-only. Approving, applying and rolling back stay
+on the command line.
+
+1. Make a token of at least 32 characters:
+   `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`
+2. Create the store with `suggest`, then start the endpoint on the Ranger Admin host:
+   ```
+   export RANGER_AI_SERVE_TOKEN=<token>
+   python -m ranger_ai_agent.cli serve            # 127.0.0.1:6090
+   ```
+   `serve` binds to loopback only. To listen elsewhere, add `--allow-non-loopback`
+   and put a TLS-terminating proxy in front, because the agent speaks plain HTTP.
+3. In `ranger-admin-site.xml`, then restart Ranger Admin:
+
+   | Property | Value |
+   |---|---|
+   | `ranger.ai.insights.enabled` | `true` (default `false`) |
+   | `ranger.ai.insights.url` | `http://127.0.0.1:6090` |
+   | `ranger.ai.insights.token` | the token, or leave empty and use the alias below |
+   | `ranger.ai.insights.credential.alias` | alias in the Ranger credential store that holds the token; used instead of the plain property when found |
+   | `ranger.ai.insights.connect.timeout.ms` / `ranger.ai.insights.read.timeout.ms` | `3000` / `10000` |
+
+Ranger Admin fetches the report with the token, so the browser never sees it. Only
+the `ROLE_SYS_ADMIN` role can call `GET /service/ai-insights/report`, and the target
+URL comes only from this configuration. If the agent is down or misconfigured the
+page shows a short error, and the details are in the Ranger Admin log. See
+[docs/design.md](docs/design.md#11-ranger-admin-ui) for the security model.
 
 ## Safety
 

@@ -30,6 +30,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ranger_ai_agent.suggestions.models import (
@@ -105,9 +106,17 @@ def _entry_hash(prev: str, ts: str, actor: str, action: str, suggestion_id: str,
 
 
 class SuggestionStore:
-    def __init__(self, path: str = ":memory:") -> None:
-        self._conn = sqlite3.connect(path)
-        self._conn.executescript(SCHEMA)
+    def __init__(self, path: str = ":memory:", read_only: bool = False) -> None:
+        """Open the store. A read-only store never creates or changes the file.
+
+        Read-only mode requires the file to exist already, and any write fails at the database.
+        """
+        if read_only:
+            uri = Path(path).resolve().as_uri() + "?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True)
+        else:
+            self._conn = sqlite3.connect(path)
+            self._conn.executescript(SCHEMA)
 
     def __enter__(self) -> "SuggestionStore":
         return self

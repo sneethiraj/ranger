@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from ranger_ai_agent.config import SafetyConfig
 from ranger_ai_agent.detectors import DetectorConfig, run_detectors
 from ranger_ai_agent.features.snapshot import SnapshotBuilder
-from ranger_ai_agent.report import change_summary, render_insights
+from ranger_ai_agent.report import build_insights, change_summary, render_insights
 from ranger_ai_agent.suggestions.apply import Applier
 from ranger_ai_agent.suggestions.models import ACTION_DISABLE_POLICY, suggestion_id_for
 from ranger_ai_agent.suggestions.service import SuggestionService
@@ -142,6 +142,28 @@ def test_tampered_log_is_reported_in_the_page():
     store._conn.execute("UPDATE action_log SET actor = 'mallory' WHERE log_id = 1")
     text = page(store)
     assert "FAILED verification" in text
+
+
+def test_build_insights_is_json_serializable_and_summarizes_changes():
+    store = populated_store(apply_removal=True)
+    data = build_insights(store, SafetyConfig(dry_run=False), NOW)
+    json.dumps(data)  # must not raise
+    assert data["counts"]["APPLIED"] == 1
+    assert data["counts"]["PENDING"] == 2
+    assert data["applications"][0]["version_after"] == 2
+    by_id = {s["id"]: s for s in data["suggestions"]}
+    assert by_id[SID_REMOVE]["change"] == "remove carol from policy 1"
+    assert by_id[SID_REMOVE]["reviewed_by"] == "alice"
+    assert data["mode"]["dry_run"] is False
+
+
+def test_build_insights_log_is_newest_first_and_limited():
+    store = populated_store()
+    data = build_insights(store, SafetyConfig(), NOW, log_limit=2)
+    assert len(data["recent_log"]) == 2
+    assert data["action_log"]["entries"] > 2
+    assert data["recent_log"][0]["action"] == "APPROVED"  # carol's approval is the latest entry
+    assert set(data["recent_log"][0]) == {"ts", "actor", "action", "suggestion_id"}  # details are not exposed
 
 
 def test_empty_store_renders_placeholders():

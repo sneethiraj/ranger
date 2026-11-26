@@ -21,6 +21,7 @@
     PYTHONPATH=src python -m ranger_ai_agent.cli apply
     PYTHONPATH=src python -m ranger_ai_agent.cli rollback <id> --requester alice
     PYTHONPATH=src python -m ranger_ai_agent.cli report --output insights.html
+    RANGER_AI_SERVE_TOKEN=<32+ char secret> PYTHONPATH=src python -m ranger_ai_agent.cli serve
     PYTHONPATH=src python -m ranger_ai_agent.cli verify-log
 
 Settings:
@@ -51,6 +52,7 @@ from ranger_ai_agent.features.snapshot import SnapshotBuilder
 from ranger_ai_agent.llm.providers import provider_from_env
 from ranger_ai_agent.models import UTC
 from ranger_ai_agent.report import render_insights
+from ranger_ai_agent.server import DEFAULT_PORT, INSIGHTS_PATH, TOKEN_ENV, make_server, validate_serve_settings
 from ranger_ai_agent.suggestions.apply import Applier
 from ranger_ai_agent.suggestions.service import SuggestionService
 from ranger_ai_agent.suggestions.store import SuggestionStore
@@ -165,6 +167,22 @@ def cmd_report(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     return EXIT_OK
 
 
+def cmd_serve(args: argparse.Namespace, store: Optional[SuggestionStore], out) -> int:
+    """Serve read-only insights JSON for Ranger Admin to proxy. Does not open the store for writing."""
+    token = validate_serve_settings(os.environ.get(TOKEN_ENV), args.host, args.allow_non_loopback)
+    if not os.path.isfile(args.store):
+        raise ValueError("store file not found: %s" % args.store)
+    server = make_server(args.host, args.port, args.store, token, SafetyConfig.from_env())
+    print("serving read-only insights on http://%s:%d%s (Ctrl-C to stop)" % (args.host, server.server_port, INSIGHTS_PATH), file=out)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return EXIT_OK
+
+
 def cmd_verify_log(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     entries = len(store.log_entries())
     if store.verify_log():
@@ -209,6 +227,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--output", help="file to write (default: standard output)")
     p.set_defaults(handler=cmd_report)
 
+    p = sub.add_parser("serve", help="serve read-only insights JSON for Ranger Admin (needs %s)" % TOKEN_ENV)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--allow-non-loopback", action="store_true", help="permit a non-loopback address (the server has no TLS)")
+    p.set_defaults(handler=cmd_serve, needs_store=False)
+
     p = sub.add_parser("verify-log", help="check the action log hash chain")
     p.set_defaults(handler=cmd_verify_log)
     return parser
@@ -218,6 +242,8 @@ def main(argv: Optional[Sequence[str]] = None, out: Any = None) -> int:
     out = out or sys.stdout
     args = _parser().parse_args(list(argv) if argv is not None else None)
     try:
+        if not getattr(args, "needs_store", True):
+            return args.handler(args, None, out)
         with SuggestionStore(args.store) as store:
             return args.handler(args, store, out)
     except KeyError as exc:

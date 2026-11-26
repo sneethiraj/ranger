@@ -136,21 +136,23 @@ the formula is documented and unit tested.
 ## 9. Open questions
 
 1. Suggestion store: SQLite is implemented. A pluggable backend is not.
-2. UI path: a standalone read-only HTML report is implemented. A thin proxy
-   endpoint in security-admin, so the browser reuses Ranger authentication, is
-   not. It needs a decision before work starts.
+2. UI path: resolved. A read-only page in Ranger Admin, reached through a thin
+   proxy endpoint so the browser reuses Ranger authentication. See section 11.
+   The standalone HTML report remains for use without Ranger Admin.
 3. Packaging: still a standalone Python package. Maven or distro integration is open.
 
 ## 10. Implementation status
 
-Implemented on `ranger_5278` and covered by unit tests (159 passing), with
-planted-anomaly accuracy measured on synthetic data only:
+Implemented on `ranger_5278` and covered by unit tests (181 Python, 24 Java),
+with planted-anomaly accuracy measured on synthetic data only:
 
 - read-only Ranger and Solr clients; a GET-only reader and a separate PUT-only writer
 - feature snapshots, feature store, three detectors, replay harness
 - LLM layer: HMAC pseudonyms, strict JSON validation, deterministic fallback, opt-in for remote endpoints
 - suggestion store, validation, human review, guarded apply, rollback
 - command-line workflow and read-only HTML report
+- read-only JSON endpoint (`serve`), a system-admin-only proxy in Ranger Admin,
+  and an "AI Insights" page in the Ranger Admin UI (section 11)
 
 Known gaps:
 
@@ -161,6 +163,86 @@ Known gaps:
   step above once proposed.
 - Per-policy audit queries run once per policy (N+1), which may be slow on large
   deployments.
-- No in-Ranger UI. The report is standalone and cannot trigger actions.
+- The Ranger Admin page is read-only. Approve, apply and rollback are
+  command-line only, by design.
+- The Ranger Admin integration has not been run in a deployed Ranger Admin with a
+  browser session. See section 11 for what was and was not checked.
 - Synthetic results show that the detectors and workflow behave as designed. They
   do not show accuracy on real audit data.
+
+## 11. Ranger Admin UI
+
+System administrators can open **Settings > AI Insights** in Ranger Admin to
+see the same information as the HTML report: mode (dry-run, kill switch, daily
+cap), action-log integrity, suggestions with explanations, applied changes and
+recent activity.
+
+```
+browser --(Ranger login)--> Ranger Admin --(bearer token)--> ranger-ai-agent serve
+        GET /service/ai-insights/report        GET /api/v1/insights (read-only store)
+```
+
+Why a proxy and a native page, not an embedded report: Ranger Admin sends
+`X-Frame-Options: DENY` and a content security policy with `connect-src 'self'`,
+so a browser cannot frame the agent or call it directly. Going through Ranger
+Admin also means the user is authenticated by whatever Ranger is configured for
+(local, LDAP, AD, SSO), and the agent needs no login of its own.
+
+Agent side (`python -m ranger_ai_agent.cli serve`):
+
+- Serves one route, `GET /api/v1/insights`. Other paths return 404, and other
+  methods return 405.
+- Requires `RANGER_AI_SERVE_TOKEN` (at least 32 characters) as a bearer token,
+  compared in constant time. It refuses to start without one.
+- Binds to loopback by default. A non-loopback bind needs `--allow-non-loopback`,
+  and there is no TLS in the agent, so put it behind a TLS-terminating proxy.
+- Opens the suggestion store read-only for each request. It never calls Ranger or
+  the model. It cannot approve, apply or roll back.
+- Leaves out raw policy bodies and action-log details. The page gets the plain
+  change summary, not policy JSON.
+- Returns `{"error": "internal error"}` with no details on failure.
+
+Ranger Admin side (`AIInsightsREST`, `AIInsightsProxy`):
+
+- `GET /service/ai-insights/report` is limited to `ROLE_SYS_ADMIN`. Auditors and
+  other roles get 403. A unit test fails if any endpoint in the class loses that
+  restriction or accepts a non-GET method.
+- The agent URL and token come only from configuration (`ranger.ai.insights.*`).
+  No request parameter selects a target, so it cannot be used to reach other
+  hosts. Redirects are not followed, the URL may not contain credentials, and
+  only http and https are accepted.
+- The token can be held in the Ranger credential store through
+  `ranger.ai.insights.credential.alias`, so it need not sit in a config file.
+- Limits: 3 s connect and 10 s read timeouts (configurable), a 5 MiB response cap,
+  and the body must be a JSON object.
+- Off by default. While `ranger.ai.insights.enabled` is not `true`, the endpoint
+  returns `{"enabled": false}` and contacts nothing.
+- Failures reach the browser as 503 (misconfigured) or 502 (agent unreachable or
+  invalid) with a fixed message. Details go to the Ranger Admin log, which never
+  contains the token.
+
+UI side (`views/AIInsights/AIInsights.jsx`):
+
+- The menu entry and the route are for system administrators. The page also
+  redirects anyone else to the forbidden page.
+- It renders every value as React text, so markup in a policy name or an
+  explanation is shown literally and never run.
+- It is read-only: its only control is Refresh.
+
+What was checked: Python unit tests for the endpoint and the read-only store;
+Java unit tests for the proxy (against a local HTTP server: token and path sent,
+redirect not followed, timeout, size cap, non-JSON, bad URLs and tokens) and for
+the access rule; a production webpack build of the web app; a jsdom render of the
+page against a real agent payload, including a check that hostile markup is
+escaped; and one run of the compiled Java proxy against the real `serve`
+process (good token accepted, wrong token refused, dead port reported).
+
+What was not checked: a deployed Ranger Admin with a real login, the Spring
+Security rule firing in a running server, Ranger's CSRF filter, and the page in a
+real browser. The `@PreAuthorize` rule follows the pattern other Ranger resources
+use, but it should be confirmed by logging in as a non-admin on a test system.
+
+Trade-offs: the sidebar shows the entry to every system administrator even when
+the feature is off, and the page then explains how to enable it. The page shows
+real user names and policy IDs to system administrators, who can already see
+that data in Ranger.

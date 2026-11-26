@@ -742,4 +742,32 @@
 		<name>ranger.pam.service</name>
 		<value>login</value>
 	</property>
+	<property>
+		<name>ranger.ai.insights.enabled</name>
+		<value>false</value>
+		<description>Show the read-only AI Insights page (RANGER-5278) to system administrators. Needs the ranger-ai-agent service running with its "serve" command.</description>
+	</property>
+	<property>
+		<name>ranger.ai.insights.url</name>
+		<value></value>
+		<description>Base URL of the ranger-ai-agent service, for example http://127.0.0.1:6090. Fixed here on purpose: the browser can never choose the target.</description>
+	</property>
+	<property>
+		<name>ranger.ai.insights.token</name>
+		<value></value>
+		<description>Shared secret the agent expects (its RANGER_AI_SERVE_TOKEN). Prefer ranger.ai.insights.credential.alias so the secret is not kept in this file.</description>
+	</property>
+	<property>
+		<name>ranger.ai.insights.credential.alias</name>
+		<value></value>
+		<description>Alias in the Ranger credential store (ranger.credential.provider.path) that holds the agent token. Takes precedence over ranger.ai.insights.token when set and found.</description>
+	</property>
+	<property>
+		<name>ranger.ai.insights.connect.timeout.ms</name>
+		<value>3000</value>
+	</property>
+	<property>
+		<name>ranger.ai.insights.read.timeout.ms</name>
+		<value>10000</value>
+	</property>
 </configuration>

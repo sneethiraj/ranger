@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import html
 from datetime import datetime
-from typing import Any, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from ranger_ai_agent.config import SafetyConfig
 from ranger_ai_agent.models import format_utc
@@ -50,6 +50,62 @@ th { background: #f5f5f7; font-weight: 600; }
 .pill { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px; background: #e8e8ed; font-size: 0.8rem; }
 ul { margin: 0.2rem 0 0 1rem; padding: 0; } code { font-size: 0.85rem; }
 """
+
+
+INSIGHTS_SCHEMA = 1
+
+
+def build_insights(store: SuggestionStore, safety: SafetyConfig, generated_at: datetime, log_limit: int = LOG_LIMIT) -> Dict[str, Any]:
+    """JSON-serializable view of the store for a UI to render.
+
+    Raw policy bodies (proposal before/after) and log details are left out; the
+    UI needs the plain-language change summary, not the policy JSON.
+    """
+    suggestions = store.list()
+    counts = {status: 0 for status in STATUSES}
+    for s in suggestions:
+        counts[s.status] = counts.get(s.status, 0) + 1
+
+    entries = store.log_entries()
+    return {
+        "schema": INSIGHTS_SCHEMA,
+        "generated_at": format_utc(generated_at),
+        "mode": {
+            "dry_run": safety.dry_run,
+            "kill_switch": safety.kill_switch,
+            "max_changes_per_day": safety.max_changes_per_day,
+        },
+        "action_log": {"intact": store.verify_log(), "entries": len(entries)},
+        "counts": counts,
+        "suggestions": [
+            {
+                "id": s.suggestion_id,
+                "status": s.status,
+                "kind": s.kind,
+                "policy_id": s.policy_id,
+                "user": s.user,
+                "recommended_action": s.recommended_action,
+                "change": change_summary(s),
+                "confidence": s.confidence,
+                "detector_confidence": s.detector_confidence,
+                "llm_confidence": s.llm_confidence,
+                "llm_provider": s.llm_provider,
+                "summary": s.summary,
+                "rationale": s.rationale,
+                "caveats": list(s.caveats),
+                "evidence": list(s.evidence),
+                "as_of": s.as_of,
+                "reviewed_by": s.reviewed_by,
+                "reviewed_at": s.reviewed_at,
+            }
+            for s in suggestions
+        ],
+        "applications": store.list_applications(),
+        "recent_log": [
+            {"ts": e["ts"], "actor": e["actor"], "action": e["action"], "suggestion_id": e["suggestion_id"]}
+            for e in reversed(entries[-log_limit:])
+        ],
+    }
 
 
 def _e(value: Any) -> str:

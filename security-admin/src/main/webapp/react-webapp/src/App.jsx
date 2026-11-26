@@ -68,6 +68,7 @@ const RoleForm = lazy(
   () => import("Views/UserGroupRoleListing/role_details/RoleForm")
 );
 const Permissions = lazy(() => import("Views/PermissionsModule/Permissions"));
+const AIInsightsComp = lazy(() => import("Views/AIInsights/AIInsights"));
 const EditPermissionComp = lazy(
   () => import("Views/PermissionsModule/EditPermission")
 );
@@ -380,6 +381,8 @@ export default class App extends Component {
                       element={<EditPermissionComp />}
                     />
                   </Route>
+                  {/* AI INSIGHTS (read-only, system admins) */}
+                  <Route path="/ai-insights" element={<AIInsightsComp />} />
                   {/* ZONE LISTING / CREATE / EDIT */}
                   <Route path="/zones">
                     <Route path="zone/list" element={<ZoneListingComp />} />
