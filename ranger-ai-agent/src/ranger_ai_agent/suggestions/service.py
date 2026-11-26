@@ -78,7 +78,7 @@ class SuggestionService:
         self._provider = provider
         self._pseudo = pseudonymizer or Pseudonymizer.from_env()
         self._safety = safety or SafetyConfig.from_env()
-        self._protected: Set[int] = set(protected_policy_ids)
+        self._protected: Set[int] = set(protected_policy_ids) | set(self._safety.protected_policy_ids)
         self._max = max_per_run
         self._clock = clock or (lambda: datetime.now(UTC))
 

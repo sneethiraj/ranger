@@ -21,7 +21,7 @@ environment (or a secret manager that populates it).
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import FrozenSet, Optional, Union
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -86,16 +86,31 @@ class SolrConfig:
         )
 
 
+def _env_int_set(name: str) -> FrozenSet[int]:
+    value = os.environ.get(name, "")
+    return frozenset(int(part) for part in value.split(",") if part.strip())
+
+
 @dataclass
 class SafetyConfig:
-    """Safeguards; defaults are the most restrictive."""
+    """Safeguards; defaults are the most restrictive.
+
+    kill_switch:        stop generating and applying suggestions and rollbacks
+    dry_run:            log what would change, but never write to Ranger
+    max_changes_per_day: cap on applied changes in any rolling 24-hour window
+    protected_policy_ids: policies the agent may never change
+    """
 
     kill_switch: bool = False
     dry_run: bool = True
+    max_changes_per_day: int = 5
+    protected_policy_ids: FrozenSet[int] = field(default_factory=frozenset)
 
     @classmethod
     def from_env(cls) -> "SafetyConfig":
         return cls(
             kill_switch=_env_bool("RANGER_AI_KILL_SWITCH", False),
             dry_run=_env_bool("RANGER_AI_DRY_RUN", True),
+            max_changes_per_day=int(os.environ.get("RANGER_AI_MAX_CHANGES_PER_DAY", cls.max_changes_per_day)),
+            protected_policy_ids=_env_int_set("RANGER_AI_PROTECTED_POLICY_IDS"),
         )

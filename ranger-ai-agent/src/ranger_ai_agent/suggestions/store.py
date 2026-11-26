@@ -13,11 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SQLite store for suggestions and the append-only action log.
+"""SQLite store for suggestions, applied changes, and the append-only action log.
 
 The action log is hash-chained: each entry includes the hash of the previous
 entry, so editing or removing an entry breaks verify_log(). Triggers also
 reject UPDATE and DELETE on the log table.
+
+Status changes that accompany a Ranger write (apply, rollback) are committed in
+the same transaction as their log entry, so the store never shows an applied
+change without a record of it.
 """
 
 from __future__ import annotations
@@ -28,12 +32,22 @@ import sqlite3
 from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
-from ranger_ai_agent.suggestions.models import STATUS_APPROVED, STATUS_PENDING, STATUS_REJECTED, Suggestion
+from ranger_ai_agent.suggestions.models import (
+    STATUS_APPLIED,
+    STATUS_APPROVED,
+    STATUS_PENDING,
+    STATUS_REJECTED,
+    STATUS_ROLLED_BACK,
+    Suggestion,
+)
 
 GENESIS = "GENESIS"
 _VALID_TRANSITIONS = {
     STATUS_PENDING: frozenset({STATUS_APPROVED, STATUS_REJECTED}),
+    STATUS_APPROVED: frozenset({STATUS_APPLIED}),
+    STATUS_APPLIED: frozenset({STATUS_ROLLED_BACK}),
 }
+_HUMAN_REVIEW_STATUSES = frozenset({STATUS_APPROVED, STATUS_REJECTED})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS suggestions (
@@ -44,6 +58,17 @@ CREATE TABLE IF NOT EXISTS suggestions (
     payload       TEXT NOT NULL,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS applications (
+    application_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    suggestion_id   TEXT NOT NULL,
+    policy_id       INTEGER NOT NULL,
+    applied_at      TEXT NOT NULL,
+    applied_by      TEXT NOT NULL,
+    version_before  INTEGER,
+    version_after   INTEGER NOT NULL,
+    rolled_back_at  TEXT,
+    rolled_back_by  TEXT
 );
 CREATE TABLE IF NOT EXISTS action_log (
     log_id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,7 +92,7 @@ END;
 
 
 class InvalidTransition(ValueError):
-    """Raised when a review is attempted on a suggestion that is not pending."""
+    """Raised when a status change is not allowed from the current status."""
 
 
 def _canonical(details: Dict[str, Any]) -> str:
@@ -134,22 +159,77 @@ class SuggestionStore:
             self._append(actor, outcome, suggestion.suggestion_id, {"confidence": suggestion.confidence}, now)
         return outcome
 
-    def transition(self, suggestion_id: str, new_status: str, reviewer: str, now: str) -> Suggestion:
+    def transition(self, suggestion_id: str, new_status: str, actor: str, now: str) -> Suggestion:
+        """Human review (APPROVED or REJECTED) or a status change tied to a write."""
         with self._conn:
-            row = self._conn.execute("SELECT payload FROM suggestions WHERE suggestion_id = ?", (suggestion_id,)).fetchone()
-            if row is None:
-                raise KeyError("no suggestion with id %s" % suggestion_id)
-            current = Suggestion.from_dict(json.loads(row[0]))
-            if new_status not in _VALID_TRANSITIONS.get(current.status, frozenset()):
-                raise InvalidTransition("cannot move suggestion from %s to %s" % (current.status, new_status))
+            return self._set_status(suggestion_id, new_status, actor, now, {})
 
-            updated = replace(current, status=new_status, reviewed_by=reviewer, reviewed_at=now)
-            self._conn.execute(
-                "UPDATE suggestions SET status = ?, payload = ?, updated_at = ? WHERE suggestion_id = ?",
-                (new_status, json.dumps(updated.to_dict(), sort_keys=True), now, suggestion_id),
+    def commit_application(
+        self,
+        suggestion_id: str,
+        policy_id: int,
+        now: str,
+        actor: str,
+        version_before: Optional[int],
+        version_after: int,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Record a successful policy write and move the suggestion to APPLIED, atomically.
+
+        The single action-log entry for the status change carries `details`.
+        """
+        with self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO applications (suggestion_id, policy_id, applied_at, applied_by, version_before, version_after) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (suggestion_id, policy_id, now, actor, version_before, version_after),
             )
-            self._append(reviewer, new_status, suggestion_id, {}, now)
-        return updated
+            entry = {"policy_id": policy_id, "version_before": version_before, "version_after": version_after}
+            entry.update(details or {})
+            self._set_status(suggestion_id, STATUS_APPLIED, actor, now, entry)
+            return int(cursor.lastrowid)
+
+    def commit_rollback(
+        self,
+        application_id: int,
+        suggestion_id: str,
+        now: str,
+        actor: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record a successful rollback and move the suggestion to ROLLED_BACK, atomically."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE applications SET rolled_back_at = ?, rolled_back_by = ? WHERE application_id = ? AND rolled_back_at IS NULL",
+                (now, actor, application_id),
+            )
+            entry = {"application_id": application_id}
+            entry.update(details or {})
+            self._set_status(suggestion_id, STATUS_ROLLED_BACK, actor, now, entry)
+
+    def active_application(self, suggestion_id: str) -> Optional[Dict[str, Any]]:
+        """The most recent application that has not been rolled back."""
+        row = self._conn.execute(
+            "SELECT application_id, policy_id, applied_at, applied_by, version_before, version_after "
+            "FROM applications WHERE suggestion_id = ? AND rolled_back_at IS NULL "
+            "ORDER BY application_id DESC LIMIT 1",
+            (suggestion_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "application_id": row[0],
+            "policy_id": row[1],
+            "applied_at": row[2],
+            "applied_by": row[3],
+            "version_before": row[4],
+            "version_after": row[5],
+        }
+
+    def count_applications_since(self, since: str) -> int:
+        """Applications made at or after `since` (ISO-8601 UTC). Rolled-back changes still count."""
+        row = self._conn.execute("SELECT COUNT(*) FROM applications WHERE applied_at >= ?", (since,)).fetchone()
+        return int(row[0])
 
     def log(self, now: str, actor: str, action: str, suggestion_id: Optional[str], details: Dict[str, Any]) -> None:
         with self._conn:
@@ -190,6 +270,33 @@ class SuggestionStore:
                 return False
             prev = entry["entry_hash"]
         return True
+
+    def _set_status(
+        self,
+        suggestion_id: str,
+        new_status: str,
+        actor: str,
+        now: str,
+        details: Dict[str, Any],
+    ) -> Suggestion:
+        """Change status, validate the move, and log it. Runs inside the caller's transaction."""
+        row = self._conn.execute("SELECT payload FROM suggestions WHERE suggestion_id = ?", (suggestion_id,)).fetchone()
+        if row is None:
+            raise KeyError("no suggestion with id %s" % suggestion_id)
+        current = Suggestion.from_dict(json.loads(row[0]))
+        if new_status not in _VALID_TRANSITIONS.get(current.status, frozenset()):
+            raise InvalidTransition("cannot move suggestion from %s to %s" % (current.status, new_status))
+
+        changes: Dict[str, Any] = {"status": new_status}
+        if new_status in _HUMAN_REVIEW_STATUSES:
+            changes.update(reviewed_by=actor, reviewed_at=now)
+        updated = replace(current, **changes)
+        self._conn.execute(
+            "UPDATE suggestions SET status = ?, payload = ?, updated_at = ? WHERE suggestion_id = ?",
+            (new_status, json.dumps(updated.to_dict(), sort_keys=True), now, suggestion_id),
+        )
+        self._append(actor, new_status, suggestion_id, details, now)
+        return updated
 
     def _append(self, actor: str, action: str, suggestion_id: Optional[str], details: Dict[str, Any], now: str) -> None:
         row = self._conn.execute("SELECT entry_hash FROM action_log ORDER BY log_id DESC LIMIT 1").fetchone()
