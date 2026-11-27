@@ -37,7 +37,8 @@ const STATUS_VARIANT = {
   REJECTED: "secondary",
   APPLIED: "success",
   ROLLED_BACK: "dark",
-  EXPIRED: "light"
+  EXPIRED: "light",
+  NEEDS_ATTENTION: "danger"
 };
 
 const show = (value) =>
@@ -223,13 +224,14 @@ function ApplicationsTable({ applications }) {
             <th>Policy</th>
             <th>Applied</th>
             <th>Policy version</th>
+            <th>State</th>
             <th>Rolled back</th>
           </tr>
         </thead>
         <tbody>
           {applications.length === 0 ? (
             <tr>
-              <td colSpan={5} className="text-muted">
+              <td colSpan={6} className="text-muted">
                 Nothing has been applied.
               </td>
             </tr>
@@ -247,6 +249,7 @@ function ApplicationsTable({ applications }) {
                 <td>{`${show(a.version_before)} → ${show(
                   a.version_after
                 )}`}</td>
+                <td>{show(a.state)}</td>
                 <td>
                   {a.rolled_back_at ? (
                     <React.Fragment>

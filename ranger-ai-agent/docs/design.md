@@ -100,7 +100,7 @@ Each finding has `score` in [0, 1], a `type`, and an `evidence` list.
 id, type, confidence, summary, rationale,
 evidence[ {kind, ref} ],
 proposed_change { policy_id, before, after },
-status: PENDING | APPROVED | REJECTED | APPLIED | ROLLED_BACK | EXPIRED,
+status: PENDING | APPROVED | REJECTED | APPLIED | ROLLED_BACK | EXPIRED | NEEDS_ATTENTION,
 created_at, reviewed_by, reviewed_at, applied_at, last_seen_at
 ```
 
@@ -116,18 +116,26 @@ the formula is documented and unit tested.
   a detection run within `max_evidence_age_hours` -> read the live policy and
   require its version to equal the version the proposal was built from ->
   re-check the audit store since the snapshot, and expire the suggestion if the
-  user or policy has been used since -> PUT the proposed policy -> read it back
-  and check that grants and the enabled flag match -> record the application
-  and move the suggestion to APPLIED, in one transaction.
+  user or policy has been used since -> record the attempt as IN_FLIGHT -> PUT
+  the proposed policy -> read it back, even if the PUT reported an error, and
+  settle the attempt: APPLIED if grants and the enabled flag match the proposal
+  at a new version (the suggestion moves to APPLIED in the same transaction),
+  ABORTED if the policy is unchanged (the suggestion stays APPROVED), otherwise
+  UNCERTAIN (the suggestion moves to NEEDS_ATTENTION).
+- A person settles NEEDS_ATTENTION with `reconcile` (APPLIED, back to APPROVED,
+  or the live version recorded for rollback) or `rollback`. Attempts a crash
+  left IN_FLIGHT are settled at the start of the next apply run. Every attempt,
+  in any state, counts toward the daily cap.
 - Rollback restores the stored pre-change policy. It is refused if the policy
-  changed since the agent wrote it, and it is blocked while the kill switch is on.
+  changed since the agent wrote it (unless it already matches the original), and
+  it is blocked while the kill switch is on.
 - Safeguards: dry-run default, kill switch, rolling 24-hour change cap, protected
   policy list, and no added grants (so no admin or wildcard grants can be introduced).
   Each action may change one field only, and deny, data-mask and row-filter
   policies are never disabled, since that would widen access.
-- A failed read-back after a write is reported as `VERIFY_FAILED`. The policy is
-  left as written, and a person must inspect it. The next run reports `CONFLICT`
-  because the version has moved.
+- A write the agent cannot confirm is never silent: the attempt row stays
+  UNCERTAIN with the live version if it could be read, and the suggestion stays
+  NEEDS_ATTENTION, which `apply` skips, until a person settles it.
 
 ## 8. Security and logging
 
@@ -150,7 +158,7 @@ the formula is documented and unit tested.
 
 ## 10. Implementation status
 
-Implemented on `ranger_5278` and covered by unit tests (230 Python, 24 Java),
+Implemented on `ranger_5278` and covered by unit tests (248 Python, 24 Java),
 with planted-anomaly accuracy measured on synthetic data only:
 
 - read-only Ranger and Solr clients; a GET-only reader and a separate PUT-only writer

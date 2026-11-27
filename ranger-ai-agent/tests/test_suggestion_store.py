@@ -213,3 +213,44 @@ def test_read_only_open_of_an_old_store_asks_for_an_upgrade(tmp_path):
         SuggestionStore(path, read_only=True)
     SuggestionStore(path).close()
     SuggestionStore(path, read_only=True).close()
+
+
+def test_old_applications_table_is_rebuilt_with_states(tmp_path):
+    path = str(tmp_path / "v1.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE applications (application_id INTEGER PRIMARY KEY AUTOINCREMENT, suggestion_id TEXT NOT NULL, "
+        "policy_id INTEGER NOT NULL, applied_at TEXT NOT NULL, applied_by TEXT NOT NULL, version_before INTEGER, "
+        "version_after INTEGER NOT NULL, rolled_back_at TEXT, rolled_back_by TEXT);"
+        "INSERT INTO applications (suggestion_id, policy_id, applied_at, applied_by, version_before, version_after) "
+        "VALUES ('a', 1, '2026-06-01T00:00:00Z', 'agent', 3, 4);"
+        "INSERT INTO applications (suggestion_id, policy_id, applied_at, applied_by, version_before, version_after, "
+        "rolled_back_at, rolled_back_by) VALUES ('b', 2, '2026-06-01T00:00:00Z', 'agent', 1, 2, '2026-06-02T00:00:00Z', 'bob');"
+        "PRAGMA user_version = 1;"
+    )
+    conn.close()
+
+    with SuggestionStore(path) as store:
+        rows = {a["suggestion_id"]: a for a in store.list_applications()}
+        assert rows["a"]["state"] == "APPLIED" and rows["a"]["version_after"] == 4
+        assert rows["b"]["state"] == "ROLLED_BACK" and rows["b"]["rolled_back_by"] == "bob"
+        assert store.active_application("a")["application_id"] == rows["a"]["application_id"]
+        # version_after may now be unknown
+        store._conn.execute(
+            "INSERT INTO applications (suggestion_id, policy_id, state, applied_at, applied_by) "
+            "VALUES ('c', 3, 'UNCERTAIN', '2026-06-03T00:00:00Z', 'agent')"
+        )
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+
+def test_application_writes_check_the_attempt_state():
+    with SuggestionStore() as store:
+        store.upsert_pending(make_suggestion(), NOW, "agent")
+        store.transition("abc", STATUS_APPROVED, "alice", NOW)
+        app_id = store.begin_application("abc", 1, NOW, "agent", 3, "b" * 64, "a" * 64)
+        store.abort_application(app_id, "abc", NOW, "agent", "FAILED")
+        with pytest.raises(InvalidTransition):
+            store.commit_application(app_id, "abc", NOW, "agent", 4)  # an aborted attempt cannot become applied
+        with pytest.raises(KeyError):
+            store.commit_application(app_id, "other", NOW, "agent", 4)
+        assert store.verify_log() is True

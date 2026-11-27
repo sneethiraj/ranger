@@ -20,6 +20,7 @@
     PYTHONPATH=src python -m ranger_ai_agent.cli approve <id> --reviewer alice
     PYTHONPATH=src python -m ranger_ai_agent.cli apply
     PYTHONPATH=src python -m ranger_ai_agent.cli rollback <id> --requester alice
+    PYTHONPATH=src python -m ranger_ai_agent.cli reconcile <id> --reviewer alice
     PYTHONPATH=src python -m ranger_ai_agent.cli report --output insights.html
     RANGER_AI_SERVE_TOKEN=<32+ char secret> PYTHONPATH=src python -m ranger_ai_agent.cli serve
     PYTHONPATH=src python -m ranger_ai_agent.cli verify-log
@@ -166,6 +167,13 @@ def cmd_rollback(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     return EXIT_OK
 
 
+def cmd_reconcile(args: argparse.Namespace, store: SuggestionStore, out) -> int:
+    reader, writer = build_ranger_clients()
+    result = Applier(store, reader, writer, safety=SafetyConfig.from_env()).reconcile(args.suggestion_id, args.reviewer)
+    print("%-20s %-16s %s" % (result.suggestion_id, result.outcome, result.detail), file=out)
+    return EXIT_OK
+
+
 def cmd_report(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     page = render_insights(store, SafetyConfig.from_env(), datetime.now(UTC))
     if args.output:
@@ -212,7 +220,7 @@ def _parser() -> argparse.ArgumentParser:
     p.set_defaults(handler=cmd_suggest)
 
     p = sub.add_parser("list", help="list suggestions")
-    p.add_argument("--status", choices=["PENDING", "APPROVED", "REJECTED", "APPLIED", "ROLLED_BACK", "EXPIRED"])
+    p.add_argument("--status", choices=["PENDING", "APPROVED", "REJECTED", "APPLIED", "ROLLED_BACK", "EXPIRED", "NEEDS_ATTENTION"])
     p.set_defaults(handler=cmd_list)
 
     p = sub.add_parser("show", help="show one suggestion as JSON")
@@ -232,6 +240,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("suggestion_id")
     p.add_argument("--requester", required=True, help="name of the person requesting the rollback")
     p.set_defaults(handler=cmd_rollback)
+
+    p = sub.add_parser("reconcile", help="settle a NEEDS_ATTENTION suggestion from the live policy")
+    p.add_argument("suggestion_id")
+    p.add_argument("--reviewer", required=True, help="name of the person who inspected the policy")
+    p.set_defaults(handler=cmd_reconcile)
 
     p = sub.add_parser("report", help="write a read-only HTML insights page")
     p.add_argument("--output", help="file to write (default: standard output)")

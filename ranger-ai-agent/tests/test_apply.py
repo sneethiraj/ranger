@@ -40,6 +40,10 @@ SID_DISABLE = suggestion_id_for("STALE_POLICY", 9, None)
 SID_REVIEW = suggestion_id_for("ABNORMAL_ACCESS_TIME", None, "dave")
 
 
+class Crash(Exception):
+    """Stands in for the agent process dying in the middle of a write."""
+
+
 class FakeRanger:
     """In-memory Ranger with the version semantics of the real policy API."""
 
@@ -48,21 +52,35 @@ class FakeRanger:
         self.writes = []
         self.fail_write = False
         self.ignore_writes = False
+        self.raise_after_write = False  # the change is saved, then the call fails (a timeout)
+        self.fail_reads_after_write = False
+        self.mangle = False  # Ranger saves something other than what was sent
+        self.crash = None  # "before" or "after" the save: the process dies mid-write
 
     def get_policy(self, policy_id):
+        if self.fail_reads_after_write and self.writes:
+            raise RangerApiError("GET policy timed out")
         if policy_id not in self.policies:
             raise RangerApiError("GET policy returned HTTP 404")
         return copy.deepcopy(self.policies[policy_id])
 
     def update_policy(self, policy_id, body):
         self.writes.append((policy_id, copy.deepcopy(body)))
+        if self.crash == "before":
+            raise Crash()
         if self.fail_write:
             raise RangerApiError("PUT policy returned HTTP 500")
         if self.ignore_writes:
             return {}
         stored = copy.deepcopy(body)
         stored["version"] = self.policies[policy_id]["version"] + 1
+        if self.mangle:
+            stored["policyItems"] = []
         self.policies[policy_id] = stored
+        if self.crash == "after":
+            raise Crash()
+        if self.raise_after_write:
+            raise RangerApiError("PUT policy timed out")
         return copy.deepcopy(stored)
 
     def concurrent_edit(self, policy_id):
@@ -212,13 +230,16 @@ def test_failed_write_leaves_suggestion_approved():
     assert store.active_application(SID_REMOVE) is None
 
 
-def test_write_that_does_not_take_effect_is_reported_and_not_recorded():
+def test_write_that_does_not_take_effect_is_recorded_as_aborted():
     store, ranger, applier, _, _ = build_world()
     ranger.ignore_writes = True
     got = outcomes(applier.apply_approved())
     assert got[SID_REMOVE] == ap.VERIFY_FAILED
     assert store.get(SID_REMOVE).status == STATUS_APPROVED
-    assert store.count_applications_since("2000-01-01T00:00:00Z") == 0
+    assert store.active_application(SID_REMOVE) is None
+    assert {a["state"] for a in store.list_applications()} == {"ABORTED"}
+    # the attempts still count toward the daily cap, so a failing write is not retried without limit
+    assert store.count_applications_since("2000-01-01T00:00:00Z") == 2
 
 
 def test_missing_policy_is_reported_as_failure():
@@ -410,3 +431,179 @@ def test_live_writes_need_an_audit_source_but_dry_runs_do_not():
     assert set(outcomes(applier_for(store, ranger, safety, None).apply_approved()).values()) == {ap.REFUSED}
     assert ranger.writes == []
     assert set(outcomes(applier_for(store, ranger, SafetyConfig(), None).apply_approved()).values()) == {ap.DRY_RUN}
+
+
+# --- every write is recorded before it is sent, and settled from what Ranger holds ---
+
+from ranger_ai_agent.suggestions.models import STATUS_NEEDS_ATTENTION  # noqa: E402
+
+
+def only(store, sid):
+    rows = [a for a in store.list_applications() if a["suggestion_id"] == sid]
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_write_that_errors_but_was_saved_is_recorded_as_applied():
+    store, ranger, applier, _, _ = build_world()
+    ranger.raise_after_write = True
+    got = outcomes(applier.apply_approved())
+    assert got[SID_REMOVE] == ap.APPLIED
+    assert store.get(SID_REMOVE).status == STATUS_APPLIED
+    assert only(store, SID_REMOVE)["state"] == "APPLIED"
+    assert only(store, SID_REMOVE)["version_after"] == 4
+    assert applier.rollback(SID_REMOVE, "bob").outcome == ap.ROLLED_BACK  # now reachable by rollback
+
+
+def test_unreadable_policy_after_write_needs_attention():
+    store, ranger, applier, _, _ = build_world()
+    ranger.fail_reads_after_write = True
+    got = outcomes(applier.apply_approved())
+    assert got[SID_REMOVE] == ap.NEEDS_ATTENTION
+    assert store.get(SID_REMOVE).status == STATUS_NEEDS_ATTENTION
+    row = only(store, SID_REMOVE)
+    assert (row["state"], row["version_after"]) == ("UNCERTAIN", None)
+    assert store.verify_log() is True
+
+
+def test_policy_matching_neither_side_needs_attention_with_its_version():
+    store, ranger, applier, _, _ = build_world()
+    ranger.mangle = True
+    got = outcomes(applier.apply_approved())
+    assert got[SID_REMOVE] == ap.NEEDS_ATTENTION
+    assert only(store, SID_REMOVE)["version_after"] == 4
+
+
+def test_needs_attention_is_not_retried_and_not_expired():
+    store, ranger, applier, service, _ = build_world(approve=(SID_REMOVE,))
+    ranger.fail_reads_after_write = True
+    applier.apply_approved()
+    ranger.fail_reads_after_write = False
+    writes = len(ranger.writes)
+    assert SID_REMOVE not in outcomes(applier.apply_approved())
+    assert len(ranger.writes) == writes
+    assert SID_REMOVE not in store.expire_missing(set(), "2026-06-01T00:00:00Z", "agent")
+    assert store.get(SID_REMOVE).status == STATUS_NEEDS_ATTENTION
+
+
+def test_uncertain_attempts_count_toward_the_daily_cap():
+    store, ranger, _, _, _ = build_world()
+    ranger.fail_reads_after_write = True
+    capped = applier_for(store, ranger, SafetyConfig(dry_run=False, max_changes_per_day=1), FakeAudit())
+    assert sorted(outcomes(capped.apply_approved()).values()) == [ap.CAP_REACHED, ap.NEEDS_ATTENTION]
+
+
+def test_cap_is_not_double_counted_within_a_run():
+    store, ranger, _, _, _ = build_world()
+    two = applier_for(store, ranger, SafetyConfig(dry_run=False, max_changes_per_day=2), FakeAudit())
+    assert set(outcomes(two.apply_approved()).values()) == {ap.APPLIED}
+
+
+def test_crash_after_save_is_recovered_as_applied_without_writing_again():
+    store, ranger, applier, _, _ = build_world(approve=(SID_REMOVE,))
+    ranger.crash = "after"
+    with pytest.raises(Crash):
+        applier.apply_approved()
+    assert only(store, SID_REMOVE)["state"] == "IN_FLIGHT"
+
+    ranger.crash = None
+    got = outcomes(applier.apply_approved())
+    assert got[SID_REMOVE] == ap.APPLIED
+    assert len(ranger.writes) == 1
+    assert store.get(SID_REMOVE).status == STATUS_APPLIED
+    assert store.verify_log() is True
+
+
+def test_crash_before_save_is_recovered_as_aborted_and_then_retried():
+    store, ranger, applier, _, _ = build_world(approve=(SID_REMOVE,))
+    ranger.crash = "before"
+    with pytest.raises(Crash):
+        applier.apply_approved()
+
+    ranger.crash = None
+    results = applier.apply_approved()
+    assert [r.outcome for r in results] == [ap.FAILED, ap.APPLIED]  # recovery, then the retry
+    states = [a["state"] for a in store.list_applications()]
+    assert states == ["ABORTED", "APPLIED"]
+
+
+def test_reconcile_confirms_a_write_that_did_happen():
+    store, ranger, applier, _, _ = build_world()
+    ranger.fail_reads_after_write = True
+    applier.apply_approved()
+    ranger.fail_reads_after_write = False
+
+    result = applier.reconcile(SID_REMOVE, "carol-admin")
+    assert result.outcome == ap.APPLIED
+    assert store.get(SID_REMOVE).status == STATUS_APPLIED
+    assert store.active_application(SID_REMOVE)["version_after"] == ranger.policies[1]["version"]
+    assert any(e["action"] == STATUS_APPLIED and e["actor"] == "carol-admin" for e in store.log_entries())
+
+
+def test_reconcile_reopens_a_write_that_did_not_happen():
+    store, ranger, applier, _, _ = build_world()
+    ranger.fail_reads_after_write = True
+    original = copy.deepcopy(ranger.policies[1])
+    applier.apply_approved()
+    ranger.fail_reads_after_write = False
+    ranger.policies[1] = original  # it turns out the change never landed
+
+    result = applier.reconcile(SID_REMOVE, "bob")
+    assert result.outcome == ap.ABORTED
+    assert store.get(SID_REMOVE).status == STATUS_APPROVED
+    assert only(store, SID_REMOVE)["state"] == "ABORTED"
+
+
+def test_reconcile_of_a_mangled_policy_records_its_version_so_rollback_can_restore():
+    store, ranger, applier, _, _ = build_world()
+    ranger.fail_reads_after_write = True
+    original = copy.deepcopy(ranger.policies[1])
+    ranger.mangle = True
+    applier.apply_approved()
+    ranger.fail_reads_after_write = False
+
+    assert applier.reconcile(SID_REMOVE, "bob").outcome == ap.CONFLICT
+    assert only(store, SID_REMOVE)["version_after"] == ranger.policies[1]["version"]
+    ranger.mangle = False
+    assert applier.rollback(SID_REMOVE, "bob").outcome == ap.ROLLED_BACK
+    assert ranger.policies[1]["policyItems"] == original["policyItems"]
+    assert store.get(SID_REMOVE).status == STATUS_ROLLED_BACK
+
+
+def test_reconcile_needs_a_human_and_a_suggestion_needing_attention():
+    store, ranger, applier, _, _ = build_world()
+    with pytest.raises(ValueError, match="named human"):
+        applier.reconcile(SID_REMOVE, "agent")
+    assert applier.reconcile(SID_REMOVE, "bob").outcome == ap.NOTHING_TO_RECONCILE
+
+
+def test_rollback_with_an_unknown_version_asks_for_reconcile():
+    store, ranger, applier, _, _ = build_world()
+    ranger.fail_reads_after_write = True
+    ranger.mangle = True
+    applier.apply_approved()
+    ranger.fail_reads_after_write = False
+    result = applier.rollback(SID_REMOVE, "bob")
+    assert result.outcome == ap.REFUSED and "reconcile" in result.detail
+
+
+def test_rollback_whose_read_back_failed_completes_on_the_next_try():
+    store, ranger, applier, _, _ = build_world()
+    applier.apply_approved()
+
+    real_get = ranger.get_policy
+    reads = []
+
+    def read_back_fails_once(policy_id):
+        reads.append(policy_id)
+        if len(reads) == 2:  # the read-back right after the rollback write
+            raise RangerApiError("GET policy timed out")
+        return real_get(policy_id)
+
+    ranger.get_policy = read_back_fails_once
+    assert applier.rollback(SID_REMOVE, "bob").outcome == ap.VERIFY_FAILED
+    assert store.get(SID_REMOVE).status == STATUS_APPLIED
+    # The live version moved, but the policy matches the original, so the retry records the rollback.
+    assert applier.rollback(SID_REMOVE, "bob").outcome == ap.ROLLED_BACK
+    assert store.get(SID_REMOVE).status == STATUS_ROLLED_BACK
+    assert len(ranger.writes) == 3  # two applies and one rollback; the retry does not write again

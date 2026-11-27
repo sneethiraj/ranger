@@ -178,3 +178,12 @@ def test_safety_state_is_shown():
     assert "dry run (no changes written)" in text
     assert "ON: all agent actions stopped" in text
     assert "Daily change cap</th><td>3" in text
+
+
+def test_attempt_states_other_than_applied_are_shown():
+    store = populated_store()
+    app_id = store.begin_application(SID_REMOVE, 1, "2026-06-01T00:00:00Z", "agent", 1, "b" * 64, "a" * 64)
+    store.mark_uncertain(app_id, SID_REMOVE, "2026-06-01T00:00:00Z", "agent", None)
+    text = page(store)
+    assert "UNCERTAIN" in text
+    assert build_insights(store, SafetyConfig(), NOW)["counts"]["NEEDS_ATTENTION"] == 1

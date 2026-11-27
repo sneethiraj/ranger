@@ -22,9 +22,11 @@ reject UPDATE and DELETE on the log table.
 Suggestions carry last_seen_at: the last time a detection run found them. It
 is kept outside the payload so it can be updated for reviewed suggestions too.
 
-Status changes that accompany a Ranger write (apply, rollback) are committed in
-the same transaction as their log entry, so the store never shows an applied
-change without a record of it.
+Every write to Ranger is recorded as an IN_FLIGHT application before it is
+sent, then settled as APPLIED, ABORTED or UNCERTAIN. So a write is never made
+without a row that rollback, the daily cap, and crash recovery can find.
+Status changes that accompany a write are committed in the same transaction as
+their log entry.
 """
 
 from __future__ import annotations
@@ -37,9 +39,15 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from ranger_ai_agent.suggestions.models import (
+    APP_ABORTED,
+    APP_APPLIED,
+    APP_IN_FLIGHT,
+    APP_ROLLED_BACK,
+    APP_UNCERTAIN,
     STATUS_APPLIED,
     STATUS_APPROVED,
     STATUS_EXPIRED,
+    STATUS_NEEDS_ATTENTION,
     STATUS_PENDING,
     STATUS_REJECTED,
     STATUS_ROLLED_BACK,
@@ -48,16 +56,48 @@ from ranger_ai_agent.suggestions.models import (
 
 GENESIS = "GENESIS"
 # Bump when the schema changes, and add a step to _MIGRATIONS.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # EXPIRED -> PENDING happens only in upsert_pending, when a finding is detected again.
+# NEEDS_ATTENTION is never expired: the policy may already have been changed.
 _VALID_TRANSITIONS = {
     STATUS_PENDING: frozenset({STATUS_APPROVED, STATUS_REJECTED, STATUS_EXPIRED}),
-    STATUS_APPROVED: frozenset({STATUS_APPLIED, STATUS_EXPIRED}),
+    STATUS_APPROVED: frozenset({STATUS_APPLIED, STATUS_EXPIRED, STATUS_NEEDS_ATTENTION}),
     STATUS_APPLIED: frozenset({STATUS_ROLLED_BACK}),
+    STATUS_NEEDS_ATTENTION: frozenset({STATUS_APPLIED, STATUS_APPROVED, STATUS_ROLLED_BACK}),
 }
+_APPLICATION_COLUMNS = (
+    "application_id",
+    "suggestion_id",
+    "policy_id",
+    "state",
+    "applied_at",
+    "applied_by",
+    "version_before",
+    "version_after",
+    "before_sha256",
+    "after_sha256",
+    "rolled_back_at",
+    "rolled_back_by",
+)
 # Statuses that expire_missing() may close.
 _EXPIRABLE = (STATUS_PENDING, STATUS_APPROVED)
 _HUMAN_REVIEW_STATUSES = frozenset({STATUS_APPROVED, STATUS_REJECTED})
+
+# applied_at is when the attempt started. version_after is unknown until the write is confirmed.
+_APPLICATIONS_DDL = """
+    application_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    suggestion_id   TEXT NOT NULL,
+    policy_id       INTEGER NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'APPLIED',
+    applied_at      TEXT NOT NULL,
+    applied_by      TEXT NOT NULL,
+    version_before  INTEGER,
+    version_after   INTEGER,
+    before_sha256   TEXT,
+    after_sha256    TEXT,
+    rolled_back_at  TEXT,
+    rolled_back_by  TEXT
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS suggestions (
@@ -70,17 +110,7 @@ CREATE TABLE IF NOT EXISTS suggestions (
     updated_at    TEXT NOT NULL,
     last_seen_at  TEXT
 );
-CREATE TABLE IF NOT EXISTS applications (
-    application_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-    suggestion_id   TEXT NOT NULL,
-    policy_id       INTEGER NOT NULL,
-    applied_at      TEXT NOT NULL,
-    applied_by      TEXT NOT NULL,
-    version_before  INTEGER,
-    version_after   INTEGER NOT NULL,
-    rolled_back_at  TEXT,
-    rolled_back_by  TEXT
-);
+CREATE TABLE IF NOT EXISTS applications (%s);
 CREATE TABLE IF NOT EXISTS action_log (
     log_id        INTEGER PRIMARY KEY AUTOINCREMENT,
     ts            TEXT NOT NULL,
@@ -99,7 +129,7 @@ CREATE TRIGGER IF NOT EXISTS action_log_no_delete BEFORE DELETE ON action_log
 BEGIN
     SELECT RAISE(ABORT, 'action_log is append-only');
 END;
-"""
+""" % _APPLICATIONS_DDL
 
 
 class InvalidTransition(ValueError):
@@ -121,8 +151,28 @@ def _migrate_v1(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE suggestions SET last_seen_at = updated_at")
 
 
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    """Add applications.state and the digests, and allow an unknown version_after.
+
+    SQLite cannot drop NOT NULL in place, so the table is rebuilt. Every old row
+    was a confirmed write, so it becomes APPLIED, or ROLLED_BACK if it was undone.
+    """
+    if "state" in _columns(conn, "applications"):
+        return
+    conn.execute("CREATE TABLE applications_v2 (%s)" % _APPLICATIONS_DDL)
+    conn.execute(
+        "INSERT INTO applications_v2 (application_id, suggestion_id, policy_id, state, applied_at, applied_by, "
+        "version_before, version_after, rolled_back_at, rolled_back_by) "
+        "SELECT application_id, suggestion_id, policy_id, "
+        "CASE WHEN rolled_back_at IS NULL THEN 'APPLIED' ELSE 'ROLLED_BACK' END, "
+        "applied_at, applied_by, version_before, version_after, rolled_back_at, rolled_back_by FROM applications"
+    )
+    conn.execute("DROP TABLE applications")
+    conn.execute("ALTER TABLE applications_v2 RENAME TO applications")
+
+
 # Each step must be safe on a fresh database, where SCHEMA already has the new shape.
-_MIGRATIONS = {1: _migrate_v1}
+_MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2}
 
 
 def _canonical(details: Dict[str, Any]) -> str:
@@ -272,30 +322,138 @@ class SuggestionStore:
                 expired.append(suggestion_id)
         return expired
 
-    def commit_application(
+    def begin_application(
         self,
         suggestion_id: str,
         policy_id: int,
         now: str,
         actor: str,
         version_before: Optional[int],
+        before_sha256: str,
+        after_sha256: str,
+    ) -> int:
+        """Record a write attempt as IN_FLIGHT before it is sent. Returns the application id.
+
+        Committed on its own, so the attempt is on record even if the process dies mid-write.
+        """
+        with self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO applications (suggestion_id, policy_id, state, applied_at, applied_by, version_before, "
+                "before_sha256, after_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (suggestion_id, policy_id, APP_IN_FLIGHT, now, actor, version_before, before_sha256, after_sha256),
+            )
+            application_id = int(cursor.lastrowid)
+            self._append(
+                actor,
+                "WRITE_STARTED",
+                suggestion_id,
+                {
+                    "application_id": application_id,
+                    "policy_id": policy_id,
+                    "version_before": version_before,
+                    "before_sha256": before_sha256,
+                    "after_sha256": after_sha256,
+                },
+                now,
+            )
+        return application_id
+
+    def commit_application(
+        self,
+        application_id: int,
+        suggestion_id: str,
+        now: str,
+        actor: str,
         version_after: int,
         details: Optional[Dict[str, Any]] = None,
-    ) -> int:
-        """Record a successful policy write and move the suggestion to APPLIED, atomically.
+    ) -> None:
+        """Mark a write as confirmed and move the suggestion to APPLIED, atomically.
 
         The single action-log entry for the status change carries `details`.
         """
         with self._conn:
-            cursor = self._conn.execute(
-                "INSERT INTO applications (suggestion_id, policy_id, applied_at, applied_by, version_before, version_after) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (suggestion_id, policy_id, now, actor, version_before, version_after),
+            row = self._require_application(application_id, suggestion_id, (APP_IN_FLIGHT, APP_UNCERTAIN))
+            self._conn.execute(
+                "UPDATE applications SET state = ?, version_after = ? WHERE application_id = ?",
+                (APP_APPLIED, version_after, application_id),
             )
-            entry = {"policy_id": policy_id, "version_before": version_before, "version_after": version_after}
+            entry = {
+                "application_id": application_id,
+                "policy_id": row["policy_id"],
+                "version_before": row["version_before"],
+                "version_after": version_after,
+                "before_sha256": row["before_sha256"],
+                "after_sha256": row["after_sha256"],
+            }
             entry.update(details or {})
             self._set_status(suggestion_id, STATUS_APPLIED, actor, now, entry)
-            return int(cursor.lastrowid)
+
+    def abort_application(
+        self,
+        application_id: int,
+        suggestion_id: str,
+        now: str,
+        actor: str,
+        outcome: str,
+        details: Optional[Dict[str, Any]] = None,
+        reopen: bool = False,
+    ) -> None:
+        """Mark a write as not having taken effect. With reopen, move NEEDS_ATTENTION back to APPROVED."""
+        with self._conn:
+            self._require_application(application_id, suggestion_id, (APP_IN_FLIGHT, APP_UNCERTAIN))
+            self._conn.execute("UPDATE applications SET state = ? WHERE application_id = ?", (APP_ABORTED, application_id))
+            entry = {"application_id": application_id, "outcome": outcome}
+            entry.update(details or {})
+            if reopen:
+                self._set_status(suggestion_id, STATUS_APPROVED, actor, now, entry)
+            else:
+                self._append(actor, outcome, suggestion_id, entry, now)
+
+    def mark_uncertain(
+        self,
+        application_id: int,
+        suggestion_id: str,
+        now: str,
+        actor: str,
+        version_after: Optional[int],
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Mark a write whose effect could not be confirmed, and move the suggestion to NEEDS_ATTENTION."""
+        with self._conn:
+            self._require_application(application_id, suggestion_id, (APP_IN_FLIGHT, APP_UNCERTAIN))
+            self._conn.execute(
+                "UPDATE applications SET state = ?, version_after = ? WHERE application_id = ?",
+                (APP_UNCERTAIN, version_after, application_id),
+            )
+            entry = {"application_id": application_id, "version_after": version_after}
+            entry.update(details or {})
+            current = self._conn.execute("SELECT status FROM suggestions WHERE suggestion_id = ?", (suggestion_id,)).fetchone()
+            if current is not None and current[0] == STATUS_NEEDS_ATTENTION:
+                self._append(actor, APP_UNCERTAIN, suggestion_id, entry, now)
+            else:
+                self._set_status(suggestion_id, STATUS_NEEDS_ATTENTION, actor, now, entry)
+
+    def application(self, application_id: int) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT %s FROM applications WHERE application_id = ?" % ", ".join(_APPLICATION_COLUMNS), (application_id,)
+        ).fetchone()
+        return dict(zip(_APPLICATION_COLUMNS, row)) if row else None
+
+    def in_flight_applications(self) -> List[Dict[str, Any]]:
+        """Write attempts whose outcome was never recorded, oldest first."""
+        rows = self._conn.execute(
+            "SELECT %s FROM applications WHERE state = ? ORDER BY application_id" % ", ".join(_APPLICATION_COLUMNS),
+            (APP_IN_FLIGHT,),
+        ).fetchall()
+        return [dict(zip(_APPLICATION_COLUMNS, row)) for row in rows]
+
+    def _require_application(self, application_id: int, suggestion_id: str, states) -> Dict[str, Any]:
+        row = self.application(application_id)
+        if row is None or row["suggestion_id"] != suggestion_id:
+            raise KeyError("no application %s for suggestion %s" % (application_id, suggestion_id))
+        if row["state"] not in states:
+            raise InvalidTransition("application %s is %s, expected one of %s" % (application_id, row["state"], ", ".join(states)))
+        return row
 
     def commit_rollback(
         self,
@@ -308,52 +466,57 @@ class SuggestionStore:
         """Record a successful rollback and move the suggestion to ROLLED_BACK, atomically."""
         with self._conn:
             self._conn.execute(
-                "UPDATE applications SET rolled_back_at = ?, rolled_back_by = ? WHERE application_id = ? AND rolled_back_at IS NULL",
-                (now, actor, application_id),
+                "UPDATE applications SET state = ?, rolled_back_at = ?, rolled_back_by = ? "
+                "WHERE application_id = ? AND rolled_back_at IS NULL",
+                (APP_ROLLED_BACK, now, actor, application_id),
             )
             entry = {"application_id": application_id}
             entry.update(details or {})
             self._set_status(suggestion_id, STATUS_ROLLED_BACK, actor, now, entry)
 
     def active_application(self, suggestion_id: str) -> Optional[Dict[str, Any]]:
-        """The most recent application that has not been rolled back."""
+        """The most recent confirmed application that has not been rolled back."""
+        return self._latest_application(suggestion_id, (APP_APPLIED,))
+
+    def open_application(self, suggestion_id: str) -> Optional[Dict[str, Any]]:
+        """The most recent application that may have changed the policy: APPLIED or UNCERTAIN."""
+        return self._latest_application(suggestion_id, (APP_APPLIED, APP_UNCERTAIN))
+
+    def _latest_application(self, suggestion_id: str, states) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
-            "SELECT application_id, policy_id, applied_at, applied_by, version_before, version_after "
-            "FROM applications WHERE suggestion_id = ? AND rolled_back_at IS NULL "
-            "ORDER BY application_id DESC LIMIT 1",
-            (suggestion_id,),
+            "SELECT %s FROM applications WHERE suggestion_id = ? AND rolled_back_at IS NULL AND state IN (%s) "
+            "ORDER BY application_id DESC LIMIT 1" % (", ".join(_APPLICATION_COLUMNS), ", ".join("?" * len(states))),
+            (suggestion_id, *states),
         ).fetchone()
-        if row is None:
-            return None
-        return {
-            "application_id": row[0],
-            "policy_id": row[1],
-            "applied_at": row[2],
-            "applied_by": row[3],
-            "version_before": row[4],
-            "version_after": row[5],
-        }
+        return dict(zip(_APPLICATION_COLUMNS, row)) if row else None
+
+    def record_version_after(self, application_id: int, version_after: int, now: str, actor: str) -> None:
+        """Set the live version of an UNCERTAIN application after a person inspected it, so rollback can proceed."""
+        with self._conn:
+            row = self.application(application_id)
+            if row is None or row["state"] != APP_UNCERTAIN:
+                raise InvalidTransition("application %s is not UNCERTAIN" % application_id)
+            self._conn.execute("UPDATE applications SET version_after = ? WHERE application_id = ?", (version_after, application_id))
+            self._append(
+                actor,
+                "VERSION_RECORDED",
+                row["suggestion_id"],
+                {"application_id": application_id, "version_after": version_after},
+                now,
+            )
 
     def list_applications(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT application_id, suggestion_id, policy_id, applied_at, applied_by, version_before, version_after, "
-            "rolled_back_at, rolled_back_by FROM applications ORDER BY application_id"
+            "SELECT %s FROM applications ORDER BY application_id" % ", ".join(_APPLICATION_COLUMNS)
         ).fetchall()
-        keys = (
-            "application_id",
-            "suggestion_id",
-            "policy_id",
-            "applied_at",
-            "applied_by",
-            "version_before",
-            "version_after",
-            "rolled_back_at",
-            "rolled_back_by",
-        )
-        return [dict(zip(keys, row)) for row in rows]
+        return [dict(zip(_APPLICATION_COLUMNS, row)) for row in rows]
 
     def count_applications_since(self, since: str) -> int:
-        """Applications made at or after `since` (ISO-8601 UTC). Rolled-back changes still count."""
+        """Write attempts started at or after `since` (ISO-8601 UTC), in any state.
+
+        Aborted, uncertain and rolled-back attempts count too, so a failing write
+        cannot be retried without limit.
+        """
         row = self._conn.execute("SELECT COUNT(*) FROM applications WHERE applied_at >= ?", (since,)).fetchone()
         return int(row[0])
 

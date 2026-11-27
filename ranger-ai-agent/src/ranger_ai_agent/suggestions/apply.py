@@ -26,11 +26,19 @@ Every write follows the same steps:
      must still have no allowed access, a disabled policy must still be unused.
      If it changed, the suggestion is expired.
   6. in dry-run mode, log the planned change and stop
-  7. PUT the proposed policy, read it back, and check its effect matches the proposal
-  8. record the application and move the suggestion to APPLIED, in one transaction
+  7. record the attempt as IN_FLIGHT, then PUT the proposed policy
+  8. settle the attempt from what Ranger now holds, whether or not the PUT reported
+     an error (a timeout does not mean nothing was written):
+       - matches the proposal at a new version: APPLIED (suggestion APPLIED)
+       - unchanged at the original version: ABORTED (suggestion stays APPROVED)
+       - anything else, or unreadable: UNCERTAIN (suggestion NEEDS_ATTENTION)
+
+Attempts left IN_FLIGHT by a crash are settled the same way at the start of the
+next apply run. A person settles NEEDS_ATTENTION with reconcile or rollback.
 
 Rollback repeats the checks with the stored pre-change policy as the target. It
-refuses if the live version is not the one the agent wrote.
+refuses if the live version is not the one the agent wrote, unless the policy
+already matches the original.
 """
 
 from __future__ import annotations
@@ -54,6 +62,7 @@ from ranger_ai_agent.suggestions.models import (
     STATUS_APPLIED,
     STATUS_APPROVED,
     STATUS_EXPIRED,
+    STATUS_NEEDS_ATTENTION,
     Suggestion,
 )
 from ranger_ai_agent.suggestions.proposals import grants, validate_proposal
@@ -76,6 +85,9 @@ CAP_REACHED = "CAP_REACHED"
 NOT_APPLIED = "NOT_APPLIED"
 STALE_EVIDENCE = "STALE_EVIDENCE"
 EVIDENCE_CHANGED = "EVIDENCE_CHANGED"
+NEEDS_ATTENTION = "NEEDS_ATTENTION"
+ABORTED = "ABORTED"
+NOTHING_TO_RECONCILE = "NOTHING_TO_RECONCILE"
 
 
 class PolicyReader(Protocol):
@@ -137,15 +149,21 @@ class Applier:
         return format_utc(self._clock() - WINDOW)
 
     def apply_approved(self) -> List[ApplyResult]:
-        """Attempt every APPROVED suggestion once. Dry-run mode never writes to Ranger."""
+        """Settle interrupted writes, then attempt every APPROVED suggestion once.
+
+        Dry-run mode never writes to Ranger.
+        """
         now = self._now()
-        approved = self._store.list(STATUS_APPROVED)
 
         if self._safety.kill_switch:
+            approved = self._store.list(STATUS_APPROVED)
             self._store.log(now, AGENT, KILL_SWITCH, None, {"approved_pending": len(approved)})
             return [ApplyResult(s.suggestion_id, KILL_SWITCH, "kill switch is on") for s in approved]
 
-        results: List[ApplyResult] = []
+        results: List[ApplyResult] = self._recover(now)
+        approved = self._store.list(STATUS_APPROVED)
+        # Live attempts are rows in the store, so they are already in count_applications_since.
+        # Dry-run plans leave no row, so they are counted here.
         planned = 0
         cap_logged = False
         for index, suggestion in enumerate(approved):
@@ -163,9 +181,27 @@ class Applier:
                 break
 
             result = self._apply_one(now, suggestion)
-            if result.outcome in (APPLIED, DRY_RUN):
+            if result.outcome == DRY_RUN:
                 planned += 1
             results.append(result)
+        return results
+
+    def _recover(self, now: str) -> List[ApplyResult]:
+        """Settle write attempts that a previous run started but never recorded an outcome for."""
+        results = []
+        for row in self._store.in_flight_applications():
+            suggestion = self._store.get(row["suggestion_id"])
+            if suggestion is None:
+                continue
+            results.append(
+                self._settle(
+                    now,
+                    suggestion,
+                    row["application_id"],
+                    row["version_before"],
+                    "a previous run stopped before recording the outcome",
+                )
+            )
         return results
 
     def _apply_one(self, now: str, suggestion: Suggestion) -> ApplyResult:
@@ -220,32 +256,56 @@ class Applier:
         if self._safety.dry_run:
             return self._note(now, suggestion, DRY_RUN, "dry run; policy not changed", details)
 
+        application_id = self._store.begin_application(
+            sid, proposal.policy_id, now, AGENT, before_version, details["before_sha256"], details["after_sha256"]
+        )
+        write_error = None
         try:
             self._writer.update_policy(proposal.policy_id, copy.deepcopy(proposal.after))
         except RangerApiError as exc:
-            return self._note(now, suggestion, FAILED, "policy update failed: %s" % exc, details)
+            write_error = "policy update reported an error: %s" % exc
+        return self._settle(now, suggestion, application_id, before_version, write_error)
+
+    def _settle(
+        self,
+        now: str,
+        suggestion: Suggestion,
+        application_id: int,
+        version_before: Optional[int],
+        write_error: Optional[str],
+    ) -> ApplyResult:
+        """Decide what a write attempt did by reading the policy back, and record it."""
+        sid = suggestion.suggestion_id
+        proposal = suggestion.proposal
+        notes = {"write_error": write_error} if write_error else {}
 
         try:
-            after_live = self._reader.get_policy(proposal.policy_id)
+            live = self._reader.get_policy(proposal.policy_id)
         except RangerApiError as exc:
-            return self._note(now, suggestion, VERIFY_FAILED, "read-back failed after write: %s" % exc, details)
+            live = None
+            notes["read_error"] = str(exc)
 
-        version_after = after_live.get("version")
-        if version_after is None:
-            return self._note(now, suggestion, VERIFY_FAILED, "read-back has no policy version", details)
-        if not _same_effect(after_live, proposal.after):
-            return self._note(now, suggestion, VERIFY_FAILED, "live policy does not match proposal after write", details)
+        version = live.get("version") if live is not None else None
+        if live is not None and version is not None and version != version_before and _same_effect(live, proposal.after):
+            self._store.commit_application(application_id, sid, now, AGENT, version, details=notes)
+            detail = "policy %s updated to version %s" % (proposal.policy_id, version)
+            if write_error:
+                detail += " (the update reported an error, but the change is in place)"
+            return ApplyResult(sid, APPLIED, detail)
 
-        self._store.commit_application(
-            sid,
-            proposal.policy_id,
-            now,
-            AGENT,
-            before_version,
-            version_after,
-            details={"before_sha256": details["before_sha256"], "after_sha256": details["after_sha256"]},
-        )
-        return ApplyResult(sid, APPLIED, "policy %s updated to version %s" % (proposal.policy_id, version_after))
+        if live is not None and version == version_before and _same_effect(live, proposal.before):
+            outcome = FAILED if write_error else VERIFY_FAILED
+            detail = (write_error or "the update did not take effect") + "; policy unchanged"
+            self._store.abort_application(application_id, sid, now, AGENT, outcome, dict(notes, detail=detail))
+            return ApplyResult(sid, outcome, detail)
+
+        if live is None:
+            reason = "could not read the policy after the write: %s" % notes["read_error"]
+        else:
+            reason = "policy %s (version %r) matches neither the proposal nor the original" % (proposal.policy_id, version)
+        detail = reason + "; inspect it, then run reconcile or rollback"
+        self._store.mark_uncertain(application_id, sid, now, AGENT, version, dict(notes, detail=detail))
+        return ApplyResult(sid, NEEDS_ATTENTION, detail)
 
     def _stale_reason(self, suggestion_id: str) -> Optional[str]:
         """Why the suggestion's evidence is too old to act on, or None if it is current."""
@@ -296,18 +356,40 @@ class Applier:
             self._store.log(now, actor, KILL_SWITCH, suggestion_id, {"operation": "rollback"})
             return ApplyResult(suggestion_id, KILL_SWITCH, "kill switch is on; roll back after turning it off")
 
-        if suggestion.status != STATUS_APPLIED:
+        if suggestion.status not in (STATUS_APPLIED, STATUS_NEEDS_ATTENTION):
             return ApplyResult(suggestion_id, NOT_APPLIED, "status is %s" % suggestion.status)
 
-        application = self._store.active_application(suggestion_id)
+        application = self._store.open_application(suggestion_id)
         if application is None:
             return self._note(now, suggestion, REFUSED, "no active application record", actor=actor)
 
         policy_id = application["policy_id"]
+        before = suggestion.proposal.before
         try:
             live = self._reader.get_policy(policy_id)
         except RangerApiError as exc:
             return self._note(now, suggestion, FAILED, "could not read policy: %s" % exc, actor=actor)
+
+        if _same_effect(live, before):
+            # Already back to the original: an earlier rollback whose read-back failed, or a manual fix.
+            self._store.commit_rollback(
+                application["application_id"],
+                suggestion_id,
+                now,
+                actor,
+                details={"version_restored": live.get("version"), "already_restored": True},
+            )
+            return ApplyResult(suggestion_id, ROLLED_BACK, "policy %s already matches the original" % policy_id)
+
+        if application["version_after"] is None:
+            return self._note(
+                now,
+                suggestion,
+                REFUSED,
+                "the policy version after the write is unknown; run reconcile first",
+                {"policy_id": policy_id},
+                actor=actor,
+            )
 
         if live.get("version") != application["version_after"]:
             return self._note(
@@ -320,29 +402,86 @@ class Applier:
                 actor=actor,
             )
 
-        before = suggestion.proposal.before
         details = {"policy_id": policy_id, "application_id": application["application_id"], "before_sha256": _digest(before)}
 
         if self._safety.dry_run:
             return self._note(now, suggestion, DRY_RUN, "dry run; rollback not performed", details, actor=actor)
 
+        write_error = None
         try:
             self._writer.update_policy(policy_id, copy.deepcopy(before))
         except RangerApiError as exc:
-            return self._note(now, suggestion, FAILED, "rollback write failed: %s" % exc, details, actor=actor)
+            write_error = "rollback write reported an error: %s" % exc
 
+        # Check the result even after an error: the write may have gone through.
         try:
             restored = self._reader.get_policy(policy_id)
         except RangerApiError as exc:
-            return self._note(now, suggestion, VERIFY_FAILED, "read-back failed after rollback: %s" % exc, details, actor=actor)
+            detail = "read-back failed after rollback: %s; run rollback again to check" % exc
+            if write_error:
+                detail = write_error + "; " + detail
+            return self._note(now, suggestion, VERIFY_FAILED, detail, details, actor=actor)
 
         if not _same_effect(restored, before):
+            if write_error:
+                return self._note(now, suggestion, FAILED, write_error + "; policy not restored", details, actor=actor)
             return self._note(now, suggestion, VERIFY_FAILED, "live policy does not match pre-change state", details, actor=actor)
 
         self._store.commit_rollback(
             application["application_id"], suggestion_id, now, actor, details={"version_restored": restored.get("version")}
         )
         return ApplyResult(suggestion_id, ROLLED_BACK, "policy %s restored" % policy_id)
+
+    def reconcile(self, suggestion_id: str, reviewer: str) -> ApplyResult:
+        """Settle a NEEDS_ATTENTION suggestion from the live policy. Requires a named human.
+
+        Matches the proposal: APPLIED. Matches the original: the attempt is ABORTED and
+        the suggestion goes back to APPROVED. Matches neither: its current version is
+        recorded, so that rollback can restore the original once a person has inspected it.
+        Ranger is only read, so this is allowed while the kill switch is on.
+        """
+        actor = _require_human(reviewer)
+        now = self._now()
+        suggestion = self._store.get(suggestion_id)
+        if suggestion is None:
+            raise KeyError("no suggestion with id %s" % suggestion_id)
+        if suggestion.status != STATUS_NEEDS_ATTENTION:
+            return ApplyResult(suggestion_id, NOTHING_TO_RECONCILE, "status is %s" % suggestion.status)
+
+        application = self._store.open_application(suggestion_id)
+        if application is None:
+            return self._note(now, suggestion, REFUSED, "no open application record", actor=actor)
+
+        proposal = suggestion.proposal
+        try:
+            live = self._reader.get_policy(application["policy_id"])
+        except RangerApiError as exc:
+            return self._note(now, suggestion, FAILED, "could not read policy: %s" % exc, actor=actor)
+
+        version = live.get("version")
+        if version is not None and version != application["version_before"] and _same_effect(live, proposal.after):
+            self._store.commit_application(application["application_id"], suggestion_id, now, actor, version, {"reconciled": True})
+            return ApplyResult(suggestion_id, APPLIED, "policy %s matches the proposal at version %s" % (proposal.policy_id, version))
+
+        if _same_effect(live, proposal.before):
+            self._store.abort_application(
+                application["application_id"], suggestion_id, now, actor, ABORTED, {"live_version": version}, reopen=True
+            )
+            return ApplyResult(
+                suggestion_id, ABORTED, "policy %s matches the original; the suggestion is APPROVED again" % proposal.policy_id
+            )
+
+        if version is not None and version != application["version_after"]:
+            self._store.record_version_after(application["application_id"], version, now, actor)
+        return self._note(
+            now,
+            suggestion,
+            CONFLICT,
+            "policy %s (version %r) matches neither the proposal nor the original; fix it in Ranger, "
+            "or run rollback to restore the original" % (proposal.policy_id, version),
+            {"policy_id": proposal.policy_id, "live_version": version},
+            actor=actor,
+        )
 
     def _note(
         self,

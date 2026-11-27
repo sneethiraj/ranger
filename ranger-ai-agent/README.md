@@ -112,6 +112,7 @@ python -m ranger_ai_agent.cli show <id>
 python -m ranger_ai_agent.cli approve <id> --reviewer alice
 python -m ranger_ai_agent.cli apply                 # dry run unless RANGER_AI_DRY_RUN=0
 python -m ranger_ai_agent.cli rollback <id> --requester alice
+python -m ranger_ai_agent.cli reconcile <id> --reviewer alice  # settle a NEEDS_ATTENTION suggestion
 python -m ranger_ai_agent.cli report --output insights.html   # read-only HTML "AI Insights" page
 python -m ranger_ai_agent.cli verify-log
 python -m ranger_ai_agent.cli serve                 # read-only JSON for the Ranger Admin page (needs RANGER_AI_SERVE_TOKEN)
@@ -174,8 +175,14 @@ page shows a short error, and the details are in the Ranger Admin log. See
   the audit store since the snapshot: if the user being removed, or the policy
   being disabled, has had allowed access since, the suggestion is expired
   (`EVIDENCE_CHANGED`). Live writes are refused when Solr cannot be queried.
-- Every write is read back and checked. Rollback restores the stored pre-change
-  policy and refuses if the policy changed since the agent wrote it.
+- Every write is recorded as in flight before it is sent, then settled from what
+  Ranger holds, even if the update reported an error: applied, aborted (policy
+  unchanged), or uncertain. An uncertain write moves the suggestion to
+  `NEEDS_ATTENTION`; `reconcile` or `rollback` settles it. Attempts left in flight
+  by a crash are settled at the start of the next `apply`. Every attempt counts
+  toward the daily cap.
+- Rollback restores the stored pre-change policy and refuses if the policy
+  changed since the agent wrote it, unless it already matches the original.
 - The action log is append-only (database triggers) and hash-chained, so
   `verify-log` detects edits made around the triggers.
 - The read client is GET-only. Writes go through a separate client that can only

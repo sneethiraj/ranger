@@ -229,3 +229,27 @@ def test_suggest_reports_expired_suggestions(store_path, capsys):
     assert "0 expired" in capsys.readouterr().out
     run(store_path, "list", "--status", "EXPIRED")
     assert "0 suggestion(s)" in capsys.readouterr().out
+
+
+def test_reconcile_settles_a_write_that_needs_attention(store_path, capsys, ranger, monkeypatch):
+    monkeypatch.setenv("RANGER_AI_DRY_RUN", "0")
+    suggest_and_approve(store_path, capsys)
+
+    real_get = ranger.get_policy
+
+    def unreadable_after_a_write(policy_id):
+        if ranger.writes:
+            raise RangerApiError("GET policy timed out")
+        return real_get(policy_id)
+
+    ranger.get_policy = unreadable_after_a_write
+    run(store_path, "apply")
+    assert "NEEDS_ATTENTION" in capsys.readouterr().out
+
+    ranger.get_policy = real_get
+    assert run(store_path, "reconcile", SID_REMOVE, "--reviewer", "agent") == 1
+    assert "named human" in capsys.readouterr().err
+    assert run(store_path, "reconcile", SID_REMOVE, "--reviewer", "alice") == 0
+    assert "APPLIED" in capsys.readouterr().out
+    run(store_path, "list", "--status", "APPLIED")
+    assert "1 suggestion(s)" in capsys.readouterr().out

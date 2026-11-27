@@ -37,7 +37,7 @@ from ranger_ai_agent.models import format_utc
 from ranger_ai_agent.suggestions.models import ACTION_DISABLE_POLICY, ACTION_REMOVE_USER, STATUS_PENDING, Suggestion
 from ranger_ai_agent.suggestions.store import SuggestionStore
 
-STATUSES = ("PENDING", "APPROVED", "REJECTED", "APPLIED", "ROLLED_BACK", "EXPIRED")
+STATUSES = ("PENDING", "APPROVED", "REJECTED", "APPLIED", "ROLLED_BACK", "EXPIRED", "NEEDS_ATTENTION")
 LOG_LIMIT = 50
 
 _CSS = """
@@ -173,7 +173,12 @@ def _application_rows(applications: List[dict]) -> str:
         return "<tr><td colspan='5' class='muted'>No changes applied.</td></tr>"
     rows = []
     for a in applications:
-        status = "rolled back %s by %s" % (_e(a["rolled_back_at"]), _e(a["rolled_back_by"])) if a["rolled_back_at"] else "active"
+        if a["rolled_back_at"]:
+            status = "rolled back %s by %s" % (_e(a["rolled_back_at"]), _e(a["rolled_back_by"]))
+        elif a.get("state") == "APPLIED":
+            status = "active"
+        else:
+            status = _e(a.get("state"))
         rows.append(
             "<tr><td><code>%s</code></td><td>%s</td><td>%s → %s</td><td>%s</td><td>%s</td></tr>"
             % (

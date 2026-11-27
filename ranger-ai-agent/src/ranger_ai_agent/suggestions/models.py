@@ -33,6 +33,15 @@ STATUS_APPLIED = "APPLIED"
 STATUS_ROLLED_BACK = "ROLLED_BACK"
 # The finding is no longer detected, or its evidence changed before it was applied.
 STATUS_EXPIRED = "EXPIRED"
+# A write to Ranger may have happened but could not be confirmed; a person must settle it.
+STATUS_NEEDS_ATTENTION = "NEEDS_ATTENTION"
+
+# States of one write attempt in the applications table.
+APP_IN_FLIGHT = "IN_FLIGHT"  # recorded before the write; outcome not yet known
+APP_APPLIED = "APPLIED"  # the change is in Ranger and verified
+APP_ABORTED = "ABORTED"  # the policy was confirmed unchanged
+APP_UNCERTAIN = "UNCERTAIN"  # the policy matches neither the proposal nor the original, or could not be read
+APP_ROLLED_BACK = "ROLLED_BACK"
 
 ACTION_REMOVE_USER = "REMOVE_USER_FROM_POLICY"
 ACTION_DISABLE_POLICY = "DISABLE_POLICY"
