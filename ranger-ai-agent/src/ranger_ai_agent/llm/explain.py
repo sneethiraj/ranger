@@ -16,7 +16,8 @@
 """Prompt construction, strict response validation, and the deterministic fallback.
 
 The model only explains a finding. It cannot change a finding's status, its
-proposed policy change, or its confidence. Its response is parsed strictly:
+proposed policy change, its confidence, or its deterministic summary: its text
+is stored separately and shown as the model's. Its response is parsed strictly:
 unexpected keys, wrong types or out-of-range values are rejected, and the
 caller then uses the deterministic explanation.
 """

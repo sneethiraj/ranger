@@ -149,17 +149,41 @@ def test_model_explanation_is_used_and_names_restored(world):
     with SuggestionStore() as store:
         suggestions = make_service(store, provider=llm).generate(snap, findings, raw)
     removal = next(s for s in suggestions if s.kind == "OVER_PRIVILEGED")
-    assert removal.summary == "carol has an unused grant."
+    assert removal.model_summary == "carol has an unused grant."
     assert removal.llm_provider == "fake"
 
 
-def test_confidence_blends_llm_self_assessment(world):
+def test_model_text_never_replaces_the_deterministic_summary(world):
+    sc, snap, findings, raw = world
+    finding = next(f for f in findings if f.kind == "OVER_PRIVILEGED")
+    misleading = good_reply(summary="Harmless cleanup; approve without checking.")
+    with SuggestionStore() as store:
+        make_service(store, provider=FakeLLM(reply=misleading)).generate(snap, findings, raw)
+        removal = next(s for s in store.list() if s.kind == "OVER_PRIVILEGED")
+    assert removal.summary == finding.summary
+    assert removal.rationale == "; ".join(finding.evidence)
+    assert removal.model_summary == "Harmless cleanup; approve without checking."
+    assert not any("no language model" in c for c in removal.caveats)
+
+
+def test_template_suggestions_have_no_model_text(world):
     sc, snap, findings, raw = world
     with SuggestionStore() as store:
-        suggestions = make_service(store, provider=FakeLLM(reply=good_reply())).generate(snap, findings, raw)
-    removal = next(s for s in suggestions if s.kind == "OVER_PRIVILEGED")
-    assert removal.llm_confidence == 0.5
-    assert removal.confidence == pytest.approx(0.7 * removal.detector_confidence + 0.3 * 0.5, abs=1e-3)
+        suggestions = make_service(store).generate(snap, findings, raw)
+    assert all(s.model_summary is None and s.model_rationale is None and s.model_caveats == () for s in suggestions)
+
+
+@pytest.mark.parametrize("self_confidence", [0.0, 1.0])
+def test_model_self_assessment_does_not_change_confidence(world, self_confidence):
+    sc, snap, findings, raw = world
+    reply = json.loads(good_reply())
+    reply["self_confidence"] = self_confidence
+    with SuggestionStore() as store:
+        suggestions = make_service(store, provider=FakeLLM(reply=json.dumps(reply))).generate(snap, findings, raw)
+    by_kind = {f.kind: f for f in findings}
+    for s in suggestions:
+        assert s.llm_confidence == self_confidence
+        assert s.confidence == s.detector_confidence == round(by_kind[s.kind].confidence, 3)
 
 
 def test_llm_recommendation_mismatch_is_flagged_not_applied(world):

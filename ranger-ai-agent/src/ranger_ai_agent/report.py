@@ -48,6 +48,7 @@ th, td { border-bottom: 1px solid #d2d2d7; padding: 0.4rem 0.6rem; text-align: l
 th { background: #f5f5f7; font-weight: 600; }
 .muted { color: #6e6e73; } .ok { color: #1a7f37; font-weight: 600; } .bad { color: #cf222e; font-weight: 600; }
 .pill { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 999px; background: #e8e8ed; font-size: 0.8rem; }
+.model { margin-top: 0.4rem; padding-left: 0.5rem; border-left: 3px solid #d0d0d7; }
 ul { margin: 0.2rem 0 0 1rem; padding: 0; } code { font-size: 0.85rem; }
 """
 
@@ -93,6 +94,9 @@ def build_insights(store: SuggestionStore, safety: SafetyConfig, generated_at: d
                 "summary": s.summary,
                 "rationale": s.rationale,
                 "caveats": list(s.caveats),
+                "model_summary": s.model_summary,
+                "model_rationale": s.model_rationale,
+                "model_caveats": list(s.model_caveats),
                 "evidence": list(s.evidence),
                 "as_of": s.as_of,
                 "reviewed_by": s.reviewed_by,
@@ -134,6 +138,15 @@ def _list(items: Iterable[str]) -> str:
     return "<ul>%s</ul>" % rendered if rendered else "<span class='muted'>none</span>"
 
 
+def _model_block(s: Suggestion) -> str:
+    if not s.model_summary:
+        return ""
+    return (
+        "<div class='model'><div class='muted'>Model explanation (not verified)</div>%s<div class='muted'>%s</div>%s</div>"
+        % (_e(s.model_summary), _e(s.model_rationale), _list(s.model_caveats) if s.model_caveats else "")
+    )
+
+
 def _suggestion_rows(suggestions: List[Suggestion]) -> str:
     if not suggestions:
         return "<tr><td colspan='7' class='muted'>No suggestions yet.</td></tr>"
@@ -146,8 +159,8 @@ def _suggestion_rows(suggestions: List[Suggestion]) -> str:
             "<td><span class='pill'>%s</span>%s</td>"
             "<td>%s<div class='muted'>%s</div></td>"
             "<td>%s</td>"
-            "<td>%s<div class='muted'>detector %s · model %s</div></td>"
-            "<td>%s<div class='muted'>%s</div></td>"
+            "<td>%s<div class='muted'>from detector · model's view %s</div></td>"
+            "<td>%s<div class='muted'>%s</div>%s</td>"
             "<td>%s</td>"
             "</tr>"
             % (
@@ -158,10 +171,10 @@ def _suggestion_rows(suggestions: List[Suggestion]) -> str:
                 _e(s.llm_provider),
                 _e(change_summary(s)),
                 _conf(s.confidence),
-                _conf(s.detector_confidence),
                 _conf(s.llm_confidence),
                 _e(s.summary),
                 _e(s.rationale),
+                _model_block(s),
                 _list(s.caveats) + "<div class='muted'>evidence</div>" + _list(s.evidence),
             )
         )

@@ -159,7 +159,10 @@ page shows a short error, and the details are in the Ranger Admin log. See
 
 - Suggestions are read-only until a person approves them.
 - Proposals are built by deterministic code. A model can explain a finding but
-  cannot change its proposal, status, or confidence.
+  cannot change its proposal, status, confidence, or summary. Confidence is the
+  detector's score; the model's self-assessment is shown beside it as "model's
+  view". The model's text is stored separately and shown as "Model explanation
+  (not verified)", below the deterministic summary and change description.
 - Proposals may remove grants or disable a policy. They may never add grants,
   re-enable a policy, or change a policy's identity. A removal may change only
   `policyItems` and a disable only `isEnabled`; every other field must match.

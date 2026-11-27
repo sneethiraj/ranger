@@ -55,7 +55,6 @@ from ranger_ai_agent.suggestions.models import (
     STATUS_PENDING,
     STATUS_REJECTED,
     Suggestion,
-    combine_confidence,
     suggestion_id_for,
 )
 from ranger_ai_agent.suggestions.proposals import build_proposal, names_in_policy, validate_proposal
@@ -156,8 +155,11 @@ class SuggestionService:
             self._store.log(now, AGENT, "VALIDATION_REJECTED", sid, {"violations": violations})
             return _REFUSED, None
 
+        # The summary, rationale and confidence always come from the detector. A
+        # model's explanation is stored beside them, labelled as the model's.
+        base = template_explanation(finding)
         explanation, provider_name, llm_used = self._explain(now, sid, finding, raw)
-        caveats = list(explanation.caveats)
+        caveats = [] if llm_used else list(base.caveats)
         if llm_used and explanation.recommended_action != proposal.action:
             caveats.append("Model recommendation differs from the deterministic proposal; the proposal is authoritative.")
 
@@ -165,18 +167,21 @@ class SuggestionService:
             suggestion_id=sid,
             kind=finding.kind,
             as_of=format_utc(snap.as_of),
-            summary=explanation.summary,
-            rationale=explanation.rationale,
+            summary=base.summary,
+            rationale=base.rationale,
             recommended_action=proposal.action,
             caveats=tuple(caveats),
             evidence=finding.evidence,
             detector_confidence=round(finding.confidence, 3),
             llm_confidence=round(explanation.self_confidence, 3) if llm_used else None,
-            confidence=combine_confidence(finding.confidence, explanation.self_confidence if llm_used else None),
+            confidence=round(finding.confidence, 3),
             proposal=proposal,
             llm_provider=provider_name,
             policy_id=finding.policy_id,
             user=finding.user,
+            model_summary=explanation.summary if llm_used else None,
+            model_rationale=explanation.rationale if llm_used else None,
+            model_caveats=tuple(explanation.caveats) if llm_used else (),
         )
         self._store.upsert_pending(suggestion, now, AGENT)
         return _WRITTEN, suggestion

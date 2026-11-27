@@ -69,6 +69,7 @@ function errorMessage(error) {
 function SuggestionDetails({ suggestion }) {
   const evidence = asList(suggestion.evidence);
   const caveats = asList(suggestion.caveats);
+  const modelCaveats = asList(suggestion.model_caveats);
 
   return (
     <details>
@@ -93,6 +94,20 @@ function SuggestionDetails({ suggestion }) {
             ))}
           </ul>
         </React.Fragment>
+      )}
+      {suggestion.model_summary && (
+        <div className="border-start ps-2 mt-2" data-id="ai-insights-model">
+          <strong>Model explanation (not verified)</strong>
+          <p className="mb-1">{show(suggestion.model_summary)}</p>
+          <p className="mb-1">{show(suggestion.model_rationale)}</p>
+          {modelCaveats.length > 0 && (
+            <ul className="mb-1">
+              {modelCaveats.map((item, index) => (
+                <li key={`model-caveat-${index}`}>{show(item)}</li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
     </details>
   );
@@ -192,9 +207,9 @@ function SuggestionsTable({ suggestions }) {
                 <td>
                   {confidence(s.confidence)}
                   <div className="text-muted">
-                    {`detector ${confidence(
-                      s.detector_confidence
-                    )} · model ${confidence(s.llm_confidence)}`}
+                    {`from detector · model's view ${confidence(
+                      s.llm_confidence
+                    )}`}
                   </div>
                 </td>
                 <td>

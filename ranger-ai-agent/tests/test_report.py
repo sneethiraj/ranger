@@ -93,6 +93,16 @@ def test_hostile_model_output_is_escaped_everywhere():
     assert "<img" not in text.lower()
     assert "&lt;b&gt;bold&lt;/b&gt;" in text
     assert "&lt;i&gt;caveat&lt;/i&gt;" in text
+    assert "Model explanation (not verified)" in text
+
+
+def test_model_text_is_shown_apart_from_the_summary():
+    store = populated_store(provider=HostileModel())
+    data = build_insights(store, SafetyConfig(), NOW)
+    removal = next(s for s in data["suggestions"] if s["id"] == SID_REMOVE)
+    assert removal["model_summary"] == HOSTILE
+    assert removal["summary"] != HOSTILE
+    assert removal["confidence"] == removal["detector_confidence"]
 
 
 def test_page_has_no_scripts_and_a_strict_content_security_policy():

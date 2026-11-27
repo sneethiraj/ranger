@@ -101,11 +101,16 @@ id, type, confidence, summary, rationale,
 evidence[ {kind, ref} ],
 proposed_change { policy_id, before, after },
 status: PENDING | APPROVED | REJECTED | APPLIED | ROLLED_BACK | EXPIRED | NEEDS_ATTENTION,
-created_at, reviewed_by, reviewed_at, applied_at, last_seen_at
+created_at, reviewed_by, reviewed_at, applied_at, last_seen_at,
+detector_confidence, llm_confidence, model_summary, model_rationale, model_caveats
 ```
 
-`confidence` = weighted combination of detector score and LLM self-assessment;
-the formula is documented and unit tested.
+`confidence` is the detector score only. The LLM's self-assessment is stored as
+`llm_confidence` and shown separately; it never changes `confidence` or the
+order of suggestions. `summary` and `rationale` are always the deterministic
+text. The LLM's text is kept in `model_summary`, `model_rationale` and
+`model_caveats` and shown as an unverified model explanation, never in place of
+the deterministic text.
 
 ## 7. Approval, apply and rollback
 
@@ -158,7 +163,7 @@ the formula is documented and unit tested.
 
 ## 10. Implementation status
 
-Implemented on `ranger_5278` and covered by unit tests (248 Python, 24 Java),
+Implemented on `ranger_5278` and covered by unit tests (252 Python, 24 Java),
 with planted-anomaly accuracy measured on synthetic data only:
 
 - read-only Ranger and Solr clients; a GET-only reader and a separate PUT-only writer

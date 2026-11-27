@@ -48,20 +48,10 @@ ACTION_DISABLE_POLICY = "DISABLE_POLICY"
 ACTION_REVIEW_ONLY = "REVIEW_ONLY"
 ALLOWED_ACTIONS = (ACTION_REMOVE_USER, ACTION_DISABLE_POLICY, ACTION_REVIEW_ONLY)
 
-# Weight given to the model's self-assessed confidence when it is available.
-LLM_WEIGHT = 0.3
-
-
 def suggestion_id_for(kind: str, policy_id: Optional[int], user: Optional[str]) -> str:
     """One open suggestion per (kind, policy, user), so daily reruns refresh instead of duplicating."""
     raw = "%s|%s|%s" % (kind, "" if policy_id is None else policy_id, user or "")
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
-
-
-def combine_confidence(detector: float, llm: Optional[float]) -> float:
-    if llm is None:
-        return round(detector, 3)
-    return round((1.0 - LLM_WEIGHT) * detector + LLM_WEIGHT * llm, 3)
 
 
 @dataclass(frozen=True)
@@ -112,6 +102,11 @@ class Suggestion:
     status: str = STATUS_PENDING
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[str] = None
+    # The model's own text, kept apart from the deterministic summary and never
+    # shown in its place. None when no model produced an explanation.
+    model_summary: Optional[str] = None
+    model_rationale: Optional[str] = None
+    model_caveats: Tuple[str, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -133,6 +128,9 @@ class Suggestion:
             "status": self.status,
             "reviewed_by": self.reviewed_by,
             "reviewed_at": self.reviewed_at,
+            "model_summary": self.model_summary,
+            "model_rationale": self.model_rationale,
+            "model_caveats": list(self.model_caveats),
         }
 
     @classmethod
@@ -156,4 +154,7 @@ class Suggestion:
             status=data["status"],
             reviewed_by=data.get("reviewed_by"),
             reviewed_at=data.get("reviewed_at"),
+            model_summary=data.get("model_summary"),
+            model_rationale=data.get("model_rationale"),
+            model_caveats=tuple(data.get("model_caveats") or ()),
         )
