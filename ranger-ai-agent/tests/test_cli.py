@@ -62,6 +62,7 @@ def store_path(tmp_path):
 def ranger(monkeypatch):
     fake = FakeRanger(build_scenario().source.list_policies())
     monkeypatch.setattr(cli, "build_ranger_clients", lambda: (fake, fake))
+    monkeypatch.setattr(cli, "build_audit_source", lambda: build_scenario().source)
     return fake
 
 
@@ -193,6 +194,7 @@ def test_ranger_errors_during_apply_are_reported(store_path, capsys, monkeypatch
             raise RangerApiError("unreachable")
 
     monkeypatch.setattr(cli, "build_ranger_clients", lambda: (Down(), Down()))
+    monkeypatch.setattr(cli, "build_audit_source", lambda: build_scenario().source)
     assert run(store_path, "apply") == 0  # each suggestion reports FAILED; the run itself completes
     assert "FAILED" in capsys.readouterr().out
 
@@ -220,3 +222,10 @@ def test_report_writes_a_read_only_page(store_path, tmp_path, capsys):
     text = target.read_text(encoding="utf-8")
     assert "Ranger AI Insights" in text
     assert "<script" not in text.lower()
+
+
+def test_suggest_reports_expired_suggestions(store_path, capsys):
+    run(store_path, "suggest", "--synthetic")
+    assert "0 expired" in capsys.readouterr().out
+    run(store_path, "list", "--status", "EXPIRED")
+    assert "0 suggestion(s)" in capsys.readouterr().out

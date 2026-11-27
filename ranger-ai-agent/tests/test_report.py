@@ -76,7 +76,7 @@ def populated_store(provider=None, apply_removal=False):
     service.approve(SID_REMOVE, "alice")
     if apply_removal:
         ranger = FakeRanger(sc.source.list_policies())
-        Applier(store, ranger, ranger, safety=SafetyConfig(dry_run=False), clock=lambda: NOW).apply_approved()
+        Applier(store, ranger, ranger, safety=SafetyConfig(dry_run=False), clock=lambda: NOW, audit=sc.source).apply_approved()
     return store
 
 

@@ -100,8 +100,8 @@ Each finding has `score` in [0, 1], a `type`, and an `evidence` list.
 id, type, confidence, summary, rationale,
 evidence[ {kind, ref} ],
 proposed_change { policy_id, before, after },
-status: PENDING | APPROVED | REJECTED | APPLIED | ROLLED_BACK,
-created_at, reviewed_by, reviewed_at, applied_at
+status: PENDING | APPROVED | REJECTED | APPLIED | ROLLED_BACK | EXPIRED,
+created_at, reviewed_by, reviewed_at, applied_at, last_seen_at
 ```
 
 `confidence` = weighted combination of detector score and LLM self-assessment;
@@ -109,11 +109,16 @@ the formula is documented and unit tested.
 
 ## 7. Approval, apply and rollback
 
-- Approve (named human) -> re-validate against current protections -> read the
-  live policy and require its version to equal the version the proposal was
-  built from -> PUT the proposed policy -> read it back and check that grants
-  and the enabled flag match -> record the application and move the suggestion
-  to APPLIED, in one transaction.
+- Every `suggest` run expires the PENDING and APPROVED suggestions whose finding
+  it did not detect, or now refuses. A finding that returns reopens its
+  suggestion as PENDING, without the old approval.
+- Approve (named human) -> re-validate against current protections -> require
+  a detection run within `max_evidence_age_hours` -> read the live policy and
+  require its version to equal the version the proposal was built from ->
+  re-check the audit store since the snapshot, and expire the suggestion if the
+  user or policy has been used since -> PUT the proposed policy -> read it back
+  and check that grants and the enabled flag match -> record the application
+  and move the suggestion to APPLIED, in one transaction.
 - Rollback restores the stored pre-change policy. It is refused if the policy
   changed since the agent wrote it, and it is blocked while the kill switch is on.
 - Safeguards: dry-run default, kill switch, rolling 24-hour change cap, protected
@@ -145,7 +150,7 @@ the formula is documented and unit tested.
 
 ## 10. Implementation status
 
-Implemented on `ranger_5278` and covered by unit tests (209 Python, 24 Java),
+Implemented on `ranger_5278` and covered by unit tests (230 Python, 24 Java),
 with planted-anomaly accuracy measured on synthetic data only:
 
 - read-only Ranger and Solr clients; a GET-only reader and a separate PUT-only writer

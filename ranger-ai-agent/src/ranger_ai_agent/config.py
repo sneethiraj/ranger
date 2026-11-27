@@ -99,12 +99,14 @@ class SafetyConfig:
     dry_run:            log what would change, but never write to Ranger
     max_changes_per_day: cap on applied changes in any rolling 24-hour window
     protected_policy_ids: policies the agent may never change
+    max_evidence_age_hours: apply only suggestions a detection run confirmed this recently
     """
 
     kill_switch: bool = False
     dry_run: bool = True
     max_changes_per_day: int = 5
     protected_policy_ids: FrozenSet[int] = field(default_factory=frozenset)
+    max_evidence_age_hours: int = 48
 
     @classmethod
     def from_env(cls) -> "SafetyConfig":
@@ -113,4 +115,5 @@ class SafetyConfig:
             dry_run=_env_bool("RANGER_AI_DRY_RUN", True),
             max_changes_per_day=int(os.environ.get("RANGER_AI_MAX_CHANGES_PER_DAY", cls.max_changes_per_day)),
             protected_policy_ids=_env_int_set("RANGER_AI_PROTECTED_POLICY_IDS"),
+            max_evidence_age_hours=int(os.environ.get("RANGER_AI_MAX_EVIDENCE_AGE_HOURS", cls.max_evidence_age_hours)),
         )

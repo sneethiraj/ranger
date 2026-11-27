@@ -84,7 +84,7 @@ def build_world(safety=None, approve=(SID_REMOVE, SID_DISABLE)):
         service.approve(sid, "alice")
 
     safety = safety or SafetyConfig(kill_switch=False, dry_run=False, max_changes_per_day=5)
-    applier = ap.Applier(store, ranger, ranger, safety=safety, clock=lambda: FIXED_CLOCK)
+    applier = ap.Applier(store, ranger, ranger, safety=safety, clock=lambda: FIXED_CLOCK, audit=sc.source)
     return store, ranger, applier, service, safety
 
 
@@ -308,3 +308,105 @@ def test_store_rejects_applied_status_without_approval_or_write():
     store, ranger, applier, _, _ = build_world(approve=())
     with pytest.raises(InvalidTransition):
         store.transition(SID_REMOVE, STATUS_APPLIED, "agent", "2026-06-01T00:00:00Z")  # pending -> applied is not a lifecycle move
+
+
+# --- evidence must be current and unchanged before a write ---
+
+from datetime import timedelta  # noqa: E402
+
+from ranger_ai_agent.clients.solr_audit import PolicyUsage, SolrAuditError, UserPolicyUsage  # noqa: E402
+from ranger_ai_agent.suggestions.models import STATUS_EXPIRED  # noqa: E402
+
+
+class FakeAudit:
+    """Audit source for the re-check: usage since the snapshot, or an outage."""
+
+    def __init__(self, user_usage=(), policy_usage=(), error=None):
+        self.user_usage = list(user_usage)
+        self.policies = list(policy_usage)
+        self.error = error
+        self.windows = []
+
+    def _check(self, start, end):
+        self.windows.append((start, end))
+        if self.error:
+            raise self.error
+
+    def user_usage_for_policy(self, policy_id, start, end):
+        self._check(start, end)
+        return [u for pid, u in self.user_usage if pid == policy_id]
+
+    def policy_usage(self, start, end):
+        self._check(start, end)
+        return self.policies
+
+
+def applier_for(store, ranger, safety, audit, clock=FIXED_CLOCK):
+    return ap.Applier(store, ranger, ranger, safety=safety, clock=lambda: clock, audit=audit)
+
+
+def test_evidence_older_than_the_limit_is_not_applied():
+    store, ranger, _, _, safety = build_world()
+    late = applier_for(store, ranger, safety, FakeAudit(), clock=FIXED_CLOCK + timedelta(hours=49))
+    got = outcomes(late.apply_approved())
+    assert got == {SID_REMOVE: ap.STALE_EVIDENCE, SID_DISABLE: ap.STALE_EVIDENCE}
+    assert ranger.writes == []
+    assert store.get(SID_REMOVE).status == STATUS_APPROVED  # a fresh suggest run can confirm it again
+
+
+def test_evidence_within_the_limit_is_applied():
+    store, ranger, _, _, safety = build_world()
+    ok = applier_for(store, ranger, safety, FakeAudit(), clock=FIXED_CLOCK + timedelta(hours=47))
+    assert set(outcomes(ok.apply_approved()).values()) == {ap.APPLIED}
+
+
+def test_removal_is_expired_when_the_user_has_used_the_policy_since():
+    store, ranger, _, _, safety = build_world()
+    audit = FakeAudit(user_usage=[(1, UserPolicyUsage("carol", 3, "2026-05-31T10:00:00Z"))])
+    got = outcomes(applier_for(store, ranger, safety, audit).apply_approved())
+    assert got[SID_REMOVE] == ap.EVIDENCE_CHANGED
+    assert got[SID_DISABLE] == ap.APPLIED
+    assert [pid for pid, _ in ranger.writes] == [9]
+    assert store.get(SID_REMOVE).status == STATUS_EXPIRED
+    # the window starts at the snapshot the suggestion was built from
+    assert audit.windows[0][0] == datetime(2026, 6, 1, tzinfo=timezone.utc)
+    assert store.verify_log() is True
+
+
+def test_other_users_activity_does_not_block_the_removal():
+    store, ranger, _, _, safety = build_world()
+    audit = FakeAudit(user_usage=[(1, UserPolicyUsage("alice", 50, None))])
+    assert outcomes(applier_for(store, ranger, safety, audit).apply_approved())[SID_REMOVE] == ap.APPLIED
+
+
+def test_disable_is_expired_when_the_policy_has_been_used_since():
+    store, ranger, _, _, safety = build_world()
+    audit = FakeAudit(policy_usage=[PolicyUsage(9, 1, "2026-05-31T10:00:00Z")])
+    got = outcomes(applier_for(store, ranger, safety, audit).apply_approved())
+    assert got[SID_DISABLE] == ap.EVIDENCE_CHANGED
+    assert ranger.policies[9]["isEnabled"] is True
+    assert store.get(SID_DISABLE).status == STATUS_EXPIRED
+
+
+def test_evidence_change_is_also_caught_in_dry_run():
+    store, ranger, _, _, _ = build_world()
+    audit = FakeAudit(policy_usage=[PolicyUsage(9, 1, None)])
+    got = outcomes(applier_for(store, ranger, SafetyConfig(), audit).apply_approved())
+    assert got[SID_DISABLE] == ap.EVIDENCE_CHANGED
+    assert got[SID_REMOVE] == ap.DRY_RUN
+
+
+def test_audit_outage_fails_the_write_safely():
+    store, ranger, _, _, safety = build_world()
+    audit = FakeAudit(error=SolrAuditError("Solr returned HTTP 503"))
+    got = outcomes(applier_for(store, ranger, safety, audit).apply_approved())
+    assert set(got.values()) == {ap.FAILED}
+    assert ranger.writes == []
+    assert store.get(SID_REMOVE).status == STATUS_APPROVED
+
+
+def test_live_writes_need_an_audit_source_but_dry_runs_do_not():
+    store, ranger, _, _, safety = build_world()
+    assert set(outcomes(applier_for(store, ranger, safety, None).apply_approved()).values()) == {ap.REFUSED}
+    assert ranger.writes == []
+    assert set(outcomes(applier_for(store, ranger, SafetyConfig(), None).apply_approved()).values()) == {ap.DRY_RUN}

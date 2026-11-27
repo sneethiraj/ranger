@@ -37,7 +37,7 @@ from ranger_ai_agent.models import format_utc
 from ranger_ai_agent.suggestions.models import ACTION_DISABLE_POLICY, ACTION_REMOVE_USER, STATUS_PENDING, Suggestion
 from ranger_ai_agent.suggestions.store import SuggestionStore
 
-STATUSES = ("PENDING", "APPROVED", "REJECTED", "APPLIED", "ROLLED_BACK")
+STATUSES = ("PENDING", "APPROVED", "REJECTED", "APPLIED", "ROLLED_BACK", "EXPIRED")
 LOG_LIMIT = 50
 
 _CSS = """

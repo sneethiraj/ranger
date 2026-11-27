@@ -19,6 +19,9 @@ The action log is hash-chained: each entry includes the hash of the previous
 entry, so editing or removing an entry breaks verify_log(). Triggers also
 reject UPDATE and DELETE on the log table.
 
+Suggestions carry last_seen_at: the last time a detection run found them. It
+is kept outside the payload so it can be updated for reviewed suggestions too.
+
 Status changes that accompany a Ranger write (apply, rollback) are committed in
 the same transaction as their log entry, so the store never shows an applied
 change without a record of it.
@@ -31,11 +34,12 @@ import json
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from ranger_ai_agent.suggestions.models import (
     STATUS_APPLIED,
     STATUS_APPROVED,
+    STATUS_EXPIRED,
     STATUS_PENDING,
     STATUS_REJECTED,
     STATUS_ROLLED_BACK,
@@ -43,11 +47,16 @@ from ranger_ai_agent.suggestions.models import (
 )
 
 GENESIS = "GENESIS"
+# Bump when the schema changes, and add a step to _MIGRATIONS.
+SCHEMA_VERSION = 1
+# EXPIRED -> PENDING happens only in upsert_pending, when a finding is detected again.
 _VALID_TRANSITIONS = {
-    STATUS_PENDING: frozenset({STATUS_APPROVED, STATUS_REJECTED}),
-    STATUS_APPROVED: frozenset({STATUS_APPLIED}),
+    STATUS_PENDING: frozenset({STATUS_APPROVED, STATUS_REJECTED, STATUS_EXPIRED}),
+    STATUS_APPROVED: frozenset({STATUS_APPLIED, STATUS_EXPIRED}),
     STATUS_APPLIED: frozenset({STATUS_ROLLED_BACK}),
 }
+# Statuses that expire_missing() may close.
+_EXPIRABLE = (STATUS_PENDING, STATUS_APPROVED)
 _HUMAN_REVIEW_STATUSES = frozenset({STATUS_APPROVED, STATUS_REJECTED})
 
 SCHEMA = """
@@ -58,7 +67,8 @@ CREATE TABLE IF NOT EXISTS suggestions (
     confidence    REAL NOT NULL,
     payload       TEXT NOT NULL,
     created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+    updated_at    TEXT NOT NULL,
+    last_seen_at  TEXT
 );
 CREATE TABLE IF NOT EXISTS applications (
     application_id  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +106,25 @@ class InvalidTransition(ValueError):
     """Raised when a status change is not allowed from the current status."""
 
 
+class SchemaTooOld(RuntimeError):
+    """A read-only store was opened on a file written by an older version of the agent."""
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    return [row[1] for row in conn.execute("PRAGMA table_info(%s)" % table)]
+
+
+def _migrate_v1(conn: sqlite3.Connection) -> None:
+    """Add suggestions.last_seen_at. Existing rows count as seen when last updated."""
+    if "last_seen_at" not in _columns(conn, "suggestions"):
+        conn.execute("ALTER TABLE suggestions ADD COLUMN last_seen_at TEXT")
+        conn.execute("UPDATE suggestions SET last_seen_at = updated_at")
+
+
+# Each step must be safe on a fresh database, where SCHEMA already has the new shape.
+_MIGRATIONS = {1: _migrate_v1}
+
+
 def _canonical(details: Dict[str, Any]) -> str:
     return json.dumps(details, sort_keys=True, separators=(",", ":"))
 
@@ -114,9 +143,24 @@ class SuggestionStore:
         if read_only:
             uri = Path(path).resolve().as_uri() + "?mode=ro"
             self._conn = sqlite3.connect(uri, uri=True)
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version < SCHEMA_VERSION:
+                self._conn.close()
+                raise SchemaTooOld(
+                    "store schema version %d is older than %d; run any command that opens it for writing, "
+                    "such as `list`, to upgrade it" % (version, SCHEMA_VERSION)
+                )
         else:
             self._conn = sqlite3.connect(path)
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        for target in range(version + 1, SCHEMA_VERSION + 1):
+            with self._conn:
+                _MIGRATIONS[target](self._conn)
+                self._conn.execute("PRAGMA user_version = %d" % target)
 
     def __enter__(self) -> "SuggestionStore":
         return self
@@ -143,7 +187,11 @@ class SuggestionStore:
     def upsert_pending(self, suggestion: Suggestion, now: str, actor: str) -> str:
         """Insert, or refresh a pending suggestion. Reviewed suggestions are never changed.
 
-        Returns CREATED, REFRESHED, or SKIPPED_REVIEWED. Each outcome is written to the action log in the same transaction.
+        An EXPIRED suggestion whose finding is detected again is reopened as PENDING,
+        without its earlier review: an old approval never carries over.
+
+        Returns CREATED, REFRESHED, REOPENED, or SKIPPED_REVIEWED. Each outcome is written
+        to the action log in the same transaction.
         """
         with self._conn:
             row = self._conn.execute(
@@ -152,26 +200,77 @@ class SuggestionStore:
             payload = json.dumps(suggestion.to_dict(), sort_keys=True)
             if row is None:
                 self._conn.execute(
-                    "INSERT INTO suggestions (suggestion_id, kind, status, confidence, payload, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (suggestion.suggestion_id, suggestion.kind, suggestion.status, suggestion.confidence, payload, now, now),
+                    "INSERT INTO suggestions "
+                    "(suggestion_id, kind, status, confidence, payload, created_at, updated_at, last_seen_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (suggestion.suggestion_id, suggestion.kind, suggestion.status, suggestion.confidence, payload, now, now, now),
                 )
                 outcome = "CREATED"
+            elif row[0] == STATUS_EXPIRED:
+                reopened = replace(suggestion, status=STATUS_PENDING, reviewed_by=None, reviewed_at=None)
+                self._conn.execute(
+                    "UPDATE suggestions SET status = ?, confidence = ?, payload = ?, updated_at = ?, last_seen_at = ? "
+                    "WHERE suggestion_id = ?",
+                    (
+                        STATUS_PENDING,
+                        reopened.confidence,
+                        json.dumps(reopened.to_dict(), sort_keys=True),
+                        now,
+                        now,
+                        suggestion.suggestion_id,
+                    ),
+                )
+                outcome = "REOPENED"
             elif row[0] != STATUS_PENDING:
                 outcome = "SKIPPED_REVIEWED"
             else:
                 self._conn.execute(
-                    "UPDATE suggestions SET confidence = ?, payload = ?, updated_at = ? WHERE suggestion_id = ?",
-                    (suggestion.confidence, payload, now, suggestion.suggestion_id),
+                    "UPDATE suggestions SET confidence = ?, payload = ?, updated_at = ?, last_seen_at = ? WHERE suggestion_id = ?",
+                    (suggestion.confidence, payload, now, now, suggestion.suggestion_id),
                 )
                 outcome = "REFRESHED"
             self._append(actor, outcome, suggestion.suggestion_id, {"confidence": suggestion.confidence}, now)
         return outcome
 
-    def transition(self, suggestion_id: str, new_status: str, actor: str, now: str) -> Suggestion:
-        """Human review (APPROVED or REJECTED) or a status change tied to a write."""
+    def transition(
+        self, suggestion_id: str, new_status: str, actor: str, now: str, details: Optional[Dict[str, Any]] = None
+    ) -> Suggestion:
+        """Human review (APPROVED or REJECTED), expiry, or a status change tied to a write."""
         with self._conn:
-            return self._set_status(suggestion_id, new_status, actor, now, {})
+            return self._set_status(suggestion_id, new_status, actor, now, details or {})
+
+    def mark_seen(self, suggestion_id: str, now: str) -> None:
+        """Record that a detection run found this suggestion's finding again."""
+        with self._conn:
+            self._conn.execute("UPDATE suggestions SET last_seen_at = ? WHERE suggestion_id = ?", (now, suggestion_id))
+
+    def last_seen(self, suggestion_id: str) -> Optional[str]:
+        row = self._conn.execute("SELECT last_seen_at FROM suggestions WHERE suggestion_id = ?", (suggestion_id,)).fetchone()
+        return row[0] if row else None
+
+    def expire_missing(self, still_detected: Iterable[str], now: str, actor: str) -> List[str]:
+        """Expire every PENDING or APPROVED suggestion that is not in still_detected.
+
+        Runs in one transaction. Returns the expired ids.
+        """
+        keep = set(still_detected)
+        expired: List[str] = []
+        with self._conn:
+            rows = self._conn.execute(
+                "SELECT suggestion_id, status FROM suggestions WHERE status IN (?, ?) ORDER BY suggestion_id", _EXPIRABLE
+            ).fetchall()
+            for suggestion_id, status in rows:
+                if suggestion_id in keep:
+                    continue
+                self._set_status(
+                    suggestion_id,
+                    STATUS_EXPIRED,
+                    actor,
+                    now,
+                    {"reason": "finding no longer detected", "previous_status": status},
+                )
+                expired.append(suggestion_id)
+        return expired
 
     def commit_application(
         self,

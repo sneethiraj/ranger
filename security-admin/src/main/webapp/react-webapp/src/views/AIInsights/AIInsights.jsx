@@ -36,7 +36,8 @@ const STATUS_VARIANT = {
   APPROVED: "info",
   REJECTED: "secondary",
   APPLIED: "success",
-  ROLLED_BACK: "dark"
+  ROLLED_BACK: "dark",
+  EXPIRED: "light"
 };
 
 const show = (value) =>

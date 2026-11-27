@@ -29,7 +29,8 @@ Settings:
     RANGER_AI_RANGER_*, RANGER_AI_SOLR_*   connection settings (see config.py)
     RANGER_AI_LLM_*               optional explanation model (see llm/providers.py)
     RANGER_AI_KILL_SWITCH, RANGER_AI_DRY_RUN (default on),
-    RANGER_AI_MAX_CHANGES_PER_DAY, RANGER_AI_PROTECTED_POLICY_IDS
+    RANGER_AI_MAX_CHANGES_PER_DAY, RANGER_AI_PROTECTED_POLICY_IDS,
+    RANGER_AI_MAX_EVIDENCE_AGE_HOURS
 
 Exit codes: 0 success; 1 refused or failed request; 2 action log failed verification.
 """
@@ -69,6 +70,11 @@ def build_live_sources() -> Tuple[SolrAuditReader, RangerAdminReader]:
     return SolrAuditReader(SolrConfig.from_env()), RangerAdminReader(RangerConfig.from_env())
 
 
+def build_audit_source() -> SolrAuditReader:
+    """Read-only audit source the applier uses to re-check evidence before a write."""
+    return SolrAuditReader(SolrConfig.from_env())
+
+
 def build_ranger_clients() -> Tuple[RangerAdminReader, RangerAdminWriter]:
     """Reader and writer for applying and rolling back. The writer is only used by apply/rollback."""
     config = RangerConfig.from_env()
@@ -93,7 +99,11 @@ def cmd_suggest(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     if SafetyConfig.from_env().kill_switch:
         print("kill switch is on: no suggestions generated", file=out)
     else:
-        print("%d finding(s); %d suggestion(s) written (new or refreshed)" % (len(findings), len(written)), file=out)
+        print(
+            "%d finding(s); %d suggestion(s) written (new or refreshed); %d expired (no longer detected)"
+            % (len(findings), len(written), len(service.last_expired)),
+            file=out,
+        )
     return EXIT_OK
 
 
@@ -141,7 +151,7 @@ def cmd_apply(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     reader, writer = build_ranger_clients()
     safety = SafetyConfig.from_env()
     print("mode: %s" % ("DRY RUN (no changes written)" if safety.dry_run else "LIVE"), file=out)
-    results = Applier(store, reader, writer, safety=safety).apply_approved()
+    results = Applier(store, reader, writer, safety=safety, audit=build_audit_source()).apply_approved()
     if not results:
         print("no approved suggestions to apply", file=out)
     for r in results:
@@ -202,7 +212,7 @@ def _parser() -> argparse.ArgumentParser:
     p.set_defaults(handler=cmd_suggest)
 
     p = sub.add_parser("list", help="list suggestions")
-    p.add_argument("--status", choices=["PENDING", "APPROVED", "REJECTED", "APPLIED", "ROLLED_BACK"])
+    p.add_argument("--status", choices=["PENDING", "APPROVED", "REJECTED", "APPLIED", "ROLLED_BACK", "EXPIRED"])
     p.set_defaults(handler=cmd_list)
 
     p = sub.add_parser("show", help="show one suggestion as JSON")

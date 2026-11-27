@@ -19,11 +19,15 @@ Every write follows the same steps:
   1. honor the kill switch and the daily change cap
   2. re-validate the proposal against current safety rules (protected policies may
      have changed since approval)
-  3. read the live policy and require its version to equal the version the
+  3. require that a detection run confirmed the finding recently (last_seen_at)
+  4. read the live policy and require its version to equal the version the
      proposal was built from (optimistic concurrency; a human must re-review on conflict)
-  4. in dry-run mode, log the planned change and stop
-  5. PUT the proposed policy, read it back, and check its effect matches the proposal
-  6. record the application and move the suggestion to APPLIED, in one transaction
+  5. re-check the evidence in the audit store since the snapshot: a removed user
+     must still have no allowed access, a disabled policy must still be unused.
+     If it changed, the suggestion is expired.
+  6. in dry-run mode, log the planned change and stop
+  7. PUT the proposed policy, read it back, and check its effect matches the proposal
+  8. record the application and move the suggestion to APPLIED, in one transaction
 
 Rollback repeats the checks with the stored pre-change policy as the target. It
 refuses if the live version is not the one the agent wrote.
@@ -39,12 +43,17 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from ranger_ai_agent.clients.ranger_admin import RangerApiError
+from ranger_ai_agent.clients.solr_audit import SolrAuditError
 from ranger_ai_agent.config import SafetyConfig
-from ranger_ai_agent.models import UTC, format_utc
+from ranger_ai_agent.models import UTC, format_utc, parse_utc
+from ranger_ai_agent.sources import AuditSource
 from ranger_ai_agent.suggestions.models import (
+    ACTION_DISABLE_POLICY,
+    ACTION_REMOVE_USER,
     ACTION_REVIEW_ONLY,
     STATUS_APPLIED,
     STATUS_APPROVED,
+    STATUS_EXPIRED,
     Suggestion,
 )
 from ranger_ai_agent.suggestions.proposals import grants, validate_proposal
@@ -65,6 +74,8 @@ NO_POLICY_CHANGE = "NO_POLICY_CHANGE"
 KILL_SWITCH = "KILL_SWITCH"
 CAP_REACHED = "CAP_REACHED"
 NOT_APPLIED = "NOT_APPLIED"
+STALE_EVIDENCE = "STALE_EVIDENCE"
+EVIDENCE_CHANGED = "EVIDENCE_CHANGED"
 
 
 class PolicyReader(Protocol):
@@ -109,10 +120,13 @@ class Applier:
         writer: PolicyWriter,
         safety: Optional[SafetyConfig] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        audit: Optional[AuditSource] = None,
     ) -> None:
+        """`audit` re-checks evidence before a write. Without it, live writes are refused."""
         self._store = store
         self._reader = reader
         self._writer = writer
+        self._audit = audit
         self._safety = safety or SafetyConfig.from_env()
         self._clock = clock or (lambda: datetime.now(UTC))
 
@@ -162,6 +176,13 @@ class Applier:
         if violations:
             return self._note(now, suggestion, REFUSED, "; ".join(violations))
 
+        stale = self._stale_reason(sid)
+        if stale:
+            return self._note(now, suggestion, STALE_EVIDENCE, stale)
+
+        if self._audit is None and not self._safety.dry_run:
+            return self._note(now, suggestion, REFUSED, "no audit source configured to re-check the evidence")
+
         try:
             live = self._reader.get_policy(proposal.policy_id)
         except RangerApiError as exc:
@@ -177,6 +198,17 @@ class Applier:
                 "live version %r differs from proposal version %r; re-review required" % (live_version, before_version),
                 {"policy_id": proposal.policy_id, "live_version": live_version, "proposal_version": before_version},
             )
+
+        if self._audit is not None:
+            try:
+                changed = self._evidence_changed(suggestion)
+            except SolrAuditError as exc:
+                return self._note(now, suggestion, FAILED, "could not re-check evidence: %s" % exc)
+            if changed:
+                self._store.transition(
+                    sid, STATUS_EXPIRED, AGENT, now, {"reason": "evidence changed before apply", "detail": changed}
+                )
+                return ApplyResult(sid, EVIDENCE_CHANGED, changed + "; suggestion expired")
 
         details = {
             "policy_id": proposal.policy_id,
@@ -214,6 +246,43 @@ class Applier:
             details={"before_sha256": details["before_sha256"], "after_sha256": details["after_sha256"]},
         )
         return ApplyResult(sid, APPLIED, "policy %s updated to version %s" % (proposal.policy_id, version_after))
+
+    def _stale_reason(self, suggestion_id: str) -> Optional[str]:
+        """Why the suggestion's evidence is too old to act on, or None if it is current."""
+        seen = self._store.last_seen(suggestion_id)
+        limit = timedelta(hours=self._safety.max_evidence_age_hours)
+        if seen is None:
+            return "no detection run has confirmed this finding; run suggest again"
+        if self._clock() - parse_utc(seen) > limit:
+            return "finding last confirmed at %s, more than %d hours ago; run suggest again" % (
+                seen,
+                self._safety.max_evidence_age_hours,
+            )
+        return None
+
+    def _evidence_changed(self, suggestion: Suggestion) -> Optional[str]:
+        """Re-run the detector's key check over [snapshot time, now]. Returns what changed, or None."""
+        proposal = suggestion.proposal
+        start = parse_utc(suggestion.as_of)
+        end = self._clock()
+        if proposal.action == ACTION_REMOVE_USER:
+            for usage in self._audit.user_usage_for_policy(proposal.policy_id, start, end):
+                if usage.user == proposal.target_user and usage.allowed_count > 0:
+                    return "%s had %d allowed access(es) through policy %s since %s" % (
+                        proposal.target_user,
+                        usage.allowed_count,
+                        proposal.policy_id,
+                        suggestion.as_of,
+                    )
+        elif proposal.action == ACTION_DISABLE_POLICY:
+            for usage in self._audit.policy_usage(start, end):
+                if usage.policy_id == proposal.policy_id and usage.allowed_count > 0:
+                    return "policy %s had %d allowed access(es) since %s" % (
+                        proposal.policy_id,
+                        usage.allowed_count,
+                        suggestion.as_of,
+                    )
+        return None
 
     def rollback(self, suggestion_id: str, requested_by: str) -> ApplyResult:
         """Restore the pre-change policy for an applied suggestion. Requires a named human."""

@@ -94,6 +94,7 @@ pytest
 | `RANGER_AI_KILL_SWITCH` | `false` | Stop generating, applying, and rolling back |
 | `RANGER_AI_MAX_CHANGES_PER_DAY` | `5` | Cap on applied changes in a rolling 24-hour window |
 | `RANGER_AI_PROTECTED_POLICY_IDS` | empty | Comma-separated policy IDs the agent must never change |
+| `RANGER_AI_MAX_EVIDENCE_AGE_HOURS` | `48` | Apply only suggestions whose finding a `suggest` run confirmed this recently |
 | `RANGER_AI_STORE` | `ranger-ai-suggestions.db` | SQLite file for suggestions and the action log |
 | `RANGER_AI_LLM_PROVIDER` | `none` | `none`, `openai` (any OpenAI-compatible endpoint), or `ollama` |
 | `RANGER_AI_LLM_URL` / `RANGER_AI_LLM_MODEL` / `RANGER_AI_LLM_API_KEY` | unset | Model endpoint settings |
@@ -162,9 +163,17 @@ page shows a short error, and the details are in the Ranger Admin log. See
   re-enable a policy, or change a policy's identity. A removal may change only
   `policyItems` and a disable only `isEnabled`; every other field must match.
   A policy that denies access, masks data or filters rows is never disabled.
+- Each `suggest` run expires every pending or approved suggestion whose finding
+  it no longer detects, or now refuses. If the finding comes back, the suggestion
+  reopens as `PENDING` and needs a new approval.
 - Before any write, the applier checks the kill switch, the daily cap, the
   protected-policy list, and that the live policy version is the one the proposal
   was built from. A mismatch is reported as `CONFLICT` and nothing is written.
+- It also requires that a `suggest` run confirmed the finding within
+  `RANGER_AI_MAX_EVIDENCE_AGE_HOURS` (`STALE_EVIDENCE` otherwise), and re-checks
+  the audit store since the snapshot: if the user being removed, or the policy
+  being disabled, has had allowed access since, the suggestion is expired
+  (`EVIDENCE_CHANGED`). Live writes are refused when Solr cannot be queried.
 - Every write is read back and checked. Rollback restores the stored pre-change
   policy and refuses if the policy changed since the agent wrote it.
 - The action log is append-only (database triggers) and hash-chained, so
