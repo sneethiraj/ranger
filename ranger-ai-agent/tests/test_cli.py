@@ -58,6 +58,11 @@ def store_path(tmp_path):
     return str(tmp_path / "suggestions.db")
 
 
+@pytest.fixture(autouse=True)
+def log_key(monkeypatch):
+    monkeypatch.setenv("RANGER_AI_LOG_KEY", "test-action-log-key-0123456789abcdef")
+
+
 @pytest.fixture
 def ranger(monkeypatch):
     fake = FakeRanger(build_scenario().source.list_policies())
@@ -212,6 +217,33 @@ def test_verify_log_passes_then_detects_tampering(store_path, capsys):
 
     assert run(store_path, "verify-log") == 2
     assert "FAILED verification" in capsys.readouterr().err
+
+
+def test_verify_log_reports_signing_and_head(store_path, capsys):
+    suggest_and_approve(store_path, capsys)
+    assert run(store_path, "verify-log") == 0
+    out = capsys.readouterr().out
+    assert "signed" in out and "not signed" not in out
+    assert out.splitlines()[-1].startswith("head ")
+
+
+def test_signed_store_without_the_key_cannot_be_verified_or_written(store_path, capsys, monkeypatch):
+    suggest_and_approve(store_path, capsys)
+    monkeypatch.delenv("RANGER_AI_LOG_KEY")
+    assert run(store_path, "verify-log") == 1
+    assert "RANGER_AI_LOG_KEY" in capsys.readouterr().err
+    assert run(store_path, "suggest", "--synthetic") == 1
+    assert "LogKeyRequired" in capsys.readouterr().err
+
+
+def test_live_apply_without_a_log_key_writes_nothing(tmp_path, capsys, ranger, monkeypatch):
+    monkeypatch.delenv("RANGER_AI_LOG_KEY")
+    monkeypatch.setenv("RANGER_AI_DRY_RUN", "0")
+    path = str(tmp_path / "unsigned.db")
+    suggest_and_approve(path, capsys)
+    assert run(path, "apply") == 0
+    assert "LOG_KEY_REQUIRED" in capsys.readouterr().out
+    assert ranger.writes == 0
 
 
 def test_report_writes_a_read_only_page(store_path, tmp_path, capsys):

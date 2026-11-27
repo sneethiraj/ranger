@@ -19,6 +19,13 @@ The action log is hash-chained: each entry includes the hash of the previous
 entry, so editing or removing an entry breaks verify_log(). Triggers also
 reject UPDATE and DELETE on the log table.
 
+A plain hash chain can be recomputed by anyone who can write the file. When a
+log key is configured (RANGER_AI_LOG_KEY), entries are signed with HMAC-SHA256
+instead, so a forged or edited entry fails verification without the key. The
+first signed entry is LOG_KEY_ENABLED; after it, unsigned entries are rejected,
+and a store without the key refuses to append. Older unsigned entries are
+still checked with plain SHA-256.
+
 Suggestions carry last_seen_at: the last time a detection run found them. It
 is kept outside the payload so it can be updated for reviewed suggestions too.
 
@@ -32,11 +39,13 @@ their log entry.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional
 
 from ranger_ai_agent.suggestions.models import (
     APP_ABORTED,
@@ -56,7 +65,17 @@ from ranger_ai_agent.suggestions.models import (
 
 GENESIS = "GENESIS"
 # Bump when the schema changes, and add a step to _MIGRATIONS.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+LOG_KEY_ENV = "RANGER_AI_LOG_KEY"
+MIN_LOG_KEY_LENGTH = 32
+LOG_KEY_ENABLED = "LOG_KEY_ENABLED"
+ALG_SHA256 = "sha256"  # unkeyed: detects careless edits, not deliberate ones
+ALG_HMAC = "hmac-sha256"
+
+LOG_INTACT = "intact"
+LOG_UNVERIFIED = "unverified"  # signed entries exist, but no key was given to check them
+LOG_BROKEN = "broken"
 # EXPIRED -> PENDING happens only in upsert_pending, when a finding is detected again.
 # NEEDS_ATTENTION is never expired: the policy may already have been changed.
 _VALID_TRANSITIONS = {
@@ -119,7 +138,8 @@ CREATE TABLE IF NOT EXISTS action_log (
     suggestion_id TEXT,
     details       TEXT NOT NULL,
     prev_hash     TEXT NOT NULL,
-    entry_hash    TEXT NOT NULL
+    entry_hash    TEXT NOT NULL,
+    hash_alg      TEXT NOT NULL DEFAULT 'sha256'
 );
 CREATE TRIGGER IF NOT EXISTS action_log_no_update BEFORE UPDATE ON action_log
 BEGIN
@@ -138,6 +158,37 @@ class InvalidTransition(ValueError):
 
 class SchemaTooOld(RuntimeError):
     """A read-only store was opened on a file written by an older version of the agent."""
+
+
+class LogKeyRequired(RuntimeError):
+    """The action log is signed, and this store was opened without the key."""
+
+
+class LogCheck(NamedTuple):
+    state: str  # LOG_INTACT, LOG_UNVERIFIED or LOG_BROKEN
+    entries: int
+    signed_entries: int
+    head: str  # hash of the last entry; record it elsewhere to detect a truncated log
+    reason: str = ""
+
+    @property
+    def keyed(self) -> bool:
+        return self.signed_entries > 0
+
+
+def log_key_from_env() -> Optional[bytes]:
+    """Read the action log key. Returns None if unset; raises ValueError if too short."""
+    value = os.environ.get(LOG_KEY_ENV)
+    if not value:
+        return None
+    if len(value) < MIN_LOG_KEY_LENGTH:
+        raise ValueError("%s must be at least %d characters" % (LOG_KEY_ENV, MIN_LOG_KEY_LENGTH))
+    return value.encode("utf-8")
+
+
+def key_id(key: bytes) -> str:
+    """A short identifier for a key that does not reveal it, recorded in LOG_KEY_ENABLED."""
+    return hmac.new(key, b"ranger-ai-agent action log key id", hashlib.sha256).hexdigest()[:16]
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> List[str]:
@@ -171,8 +222,17 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE applications_v2 RENAME TO applications")
 
 
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    """Add action_log.hash_alg. Every existing entry was hashed with plain SHA-256.
+
+    ALTER TABLE does not fire the append-only triggers.
+    """
+    if "hash_alg" not in _columns(conn, "action_log"):
+        conn.execute("ALTER TABLE action_log ADD COLUMN hash_alg TEXT NOT NULL DEFAULT 'sha256'")
+
+
 # Each step must be safe on a fresh database, where SCHEMA already has the new shape.
-_MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2}
+_MIGRATIONS = {1: _migrate_v1, 2: _migrate_v2, 3: _migrate_v3}
 
 
 def _canonical(details: Dict[str, Any]) -> str:
@@ -184,12 +244,22 @@ def _entry_hash(prev: str, ts: str, actor: str, action: str, suggestion_id: str,
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _signed_hash(key: bytes, prev: str, ts: str, actor: str, action: str, suggestion_id: str, details_json: str) -> str:
+    # The algorithm name is part of the signed material, so an entry cannot be relabelled.
+    material = "\x1f".join([ALG_HMAC, prev, ts, actor, action, suggestion_id, details_json])
+    return hmac.new(key, material.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 class SuggestionStore:
-    def __init__(self, path: str = ":memory:", read_only: bool = False) -> None:
+    def __init__(self, path: str = ":memory:", read_only: bool = False, log_key: Optional[bytes] = None) -> None:
         """Open the store. A read-only store never creates or changes the file.
 
         Read-only mode requires the file to exist already, and any write fails at the database.
+        With `log_key`, new log entries are signed and signed entries can be verified.
         """
+        if log_key is not None and len(log_key) < MIN_LOG_KEY_LENGTH:
+            raise ValueError("the action log key must be at least %d bytes" % MIN_LOG_KEY_LENGTH)
+        self._key = log_key
         if read_only:
             uri = Path(path).resolve().as_uri() + "?mode=ro"
             self._conn = sqlite3.connect(uri, uri=True)
@@ -204,6 +274,11 @@ class SuggestionStore:
             self._conn = sqlite3.connect(path)
             self._conn.executescript(SCHEMA)
             self._migrate()
+
+    @property
+    def keyed(self) -> bool:
+        """True when this store signs new log entries."""
+        return self._key is not None
 
     def _migrate(self) -> None:
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
@@ -526,7 +601,8 @@ class SuggestionStore:
 
     def log_entries(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT log_id, ts, actor, action, suggestion_id, details, prev_hash, entry_hash FROM action_log ORDER BY log_id"
+            "SELECT log_id, ts, actor, action, suggestion_id, details, prev_hash, entry_hash, hash_alg "
+            "FROM action_log ORDER BY log_id"
         ).fetchall()
         return [
             {
@@ -538,27 +614,54 @@ class SuggestionStore:
                 "details": json.loads(r[5]),
                 "prev_hash": r[6],
                 "entry_hash": r[7],
+                "hash_alg": r[8],
             }
             for r in rows
         ]
 
     def verify_log(self) -> bool:
+        """True only if every entry, signed or not, checks out."""
+        return self.check_log().state == LOG_INTACT
+
+    def check_log(self) -> LogCheck:
+        entries = self.log_entries()
         prev = GENESIS
-        for entry in self.log_entries():
+        signed = 0
+        unverified = False
+
+        def result(state: str, reason: str = "") -> LogCheck:
+            return LogCheck(state, len(entries), signed, prev, reason)
+
+        for entry in entries:
+            n = entry["log_id"]
             if entry["prev_hash"] != prev:
-                return False
-            expected = _entry_hash(
-                prev,
-                entry["ts"],
-                entry["actor"],
-                entry["action"],
-                entry["suggestion_id"] or "",
-                _canonical(entry["details"]),
-            )
-            if entry["entry_hash"] != expected:
-                return False
+                return result(LOG_BROKEN, "entry %d does not follow the one before it" % n)
+            fields = (prev, entry["ts"], entry["actor"], entry["action"], entry["suggestion_id"] or "", _canonical(entry["details"]))
+            alg = entry["hash_alg"]
+            if alg == ALG_SHA256:
+                if signed:
+                    return result(LOG_BROKEN, "entry %d is unsigned, after the log became signed" % n)
+                ok = entry["entry_hash"] == _entry_hash(*fields)
+            elif alg == ALG_HMAC:
+                if not signed and entry["action"] != LOG_KEY_ENABLED:
+                    return result(LOG_BROKEN, "entry %d is signed, but signing was never enabled" % n)
+                signed += 1
+                if self._key is None:
+                    unverified = True
+                    ok = True
+                else:
+                    if entry["action"] == LOG_KEY_ENABLED and entry["details"].get("key_id") != key_id(self._key):
+                        return result(LOG_BROKEN, "entry %d was signed with a different key" % n)
+                    ok = hmac.compare_digest(entry["entry_hash"], _signed_hash(self._key, *fields))
+            else:
+                return result(LOG_BROKEN, "entry %d has unknown hash algorithm %r" % (n, alg))
+            if not ok:
+                return result(LOG_BROKEN, "entry %d does not match its hash" % n)
             prev = entry["entry_hash"]
-        return True
+
+        if unverified:
+            return result(LOG_UNVERIFIED, "the log is signed; set %s to verify it" % LOG_KEY_ENV)
+        return result(LOG_INTACT)
 
     def _set_status(
         self,
@@ -588,12 +691,25 @@ class SuggestionStore:
         return updated
 
     def _append(self, actor: str, action: str, suggestion_id: Optional[str], details: Dict[str, Any], now: str) -> None:
+        signed_log = self._conn.execute("SELECT 1 FROM action_log WHERE hash_alg = ? LIMIT 1", (ALG_HMAC,)).fetchone()
+        if self._key is None:
+            if signed_log:
+                raise LogKeyRequired("the action log is signed; set %s to write to this store" % LOG_KEY_ENV)
+        elif not signed_log:
+            self._insert_entry("agent", LOG_KEY_ENABLED, None, {"key_id": key_id(self._key)}, now)
+        self._insert_entry(actor, action, suggestion_id, details, now)
+
+    def _insert_entry(self, actor: str, action: str, suggestion_id: Optional[str], details: Dict[str, Any], now: str) -> None:
         row = self._conn.execute("SELECT entry_hash FROM action_log ORDER BY log_id DESC LIMIT 1").fetchone()
         prev = row[0] if row else GENESIS
         details_json = _canonical(details)
-        entry_hash = _entry_hash(prev, now, actor, action, suggestion_id or "", details_json)
+        fields = (prev, now, actor, action, suggestion_id or "", details_json)
+        if self._key is None:
+            alg, entry_hash = ALG_SHA256, _entry_hash(*fields)
+        else:
+            alg, entry_hash = ALG_HMAC, _signed_hash(self._key, *fields)
         self._conn.execute(
-            "INSERT INTO action_log (ts, actor, action, suggestion_id, details, prev_hash, entry_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (now, actor, action, suggestion_id, details_json, prev, entry_hash),
+            "INSERT INTO action_log (ts, actor, action, suggestion_id, details, prev_hash, entry_hash, hash_alg) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (now, actor, action, suggestion_id, details_json, prev, entry_hash, alg),
         )

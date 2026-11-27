@@ -148,6 +148,15 @@ the deterministic text.
   (provider name and SHA-256 of the prompt and of the response; never the raw
   text), reviews, applies and rollbacks. Editing or deleting entries breaks
   `verify-log`. Database triggers also reject UPDATE and DELETE.
+- With `RANGER_AI_LOG_KEY`, entries are HMAC-SHA256 signed (schema v3 adds
+  `action_log.hash_alg`). The first signed entry, `LOG_KEY_ENABLED`, records a
+  key id (an HMAC of a fixed string, not the key). After it, an unsigned entry
+  fails verification, and a store opened without the key refuses to append.
+  The log check has three results: intact, unverified (signed, but this process
+  has no key, as for `serve` without it), and broken. Live apply and rollback
+  require the key. Limits: a log rewritten from the start as unsigned looks like
+  one that was never signed, and a truncated tail is not detected; keeping the
+  head hash printed by `verify-log` outside the store catches both.
 - Non-local model endpoints are refused unless `RANGER_AI_ALLOW_EXTERNAL_LLM` is set.
 - Secrets (Ranger password, LLM API keys) come from environment variables or
   the Ranger credential provider, never from plain config files.
@@ -163,7 +172,7 @@ the deterministic text.
 
 ## 10. Implementation status
 
-Implemented on `ranger_5278` and covered by unit tests (252 Python, 24 Java),
+Implemented on `ranger_5278` and covered by unit tests (272 Python, 24 Java),
 with planted-anomaly accuracy measured on synthetic data only:
 
 - read-only Ranger and Solr clients; a GET-only reader and a separate PUT-only writer

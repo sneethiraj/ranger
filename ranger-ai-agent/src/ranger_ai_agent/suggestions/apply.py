@@ -16,7 +16,8 @@
 """Applies approved suggestions to Ranger, and rolls them back.
 
 Every write follows the same steps:
-  1. honor the kill switch and the daily change cap
+  1. honor the kill switch and the daily change cap; live writes also need an
+     audit source and a log key (RANGER_AI_LOG_KEY), so the record is signed
   2. re-validate the proposal against current safety rules (protected policies may
      have changed since approval)
   3. require that a detection run confirmed the finding recently (last_seen_at)
@@ -66,7 +67,7 @@ from ranger_ai_agent.suggestions.models import (
     Suggestion,
 )
 from ranger_ai_agent.suggestions.proposals import grants, validate_proposal
-from ranger_ai_agent.suggestions.store import SuggestionStore
+from ranger_ai_agent.suggestions.store import LOG_KEY_ENV, SuggestionStore
 
 AGENT = "agent"
 WINDOW = timedelta(hours=24)
@@ -88,6 +89,9 @@ EVIDENCE_CHANGED = "EVIDENCE_CHANGED"
 NEEDS_ATTENTION = "NEEDS_ATTENTION"
 ABORTED = "ABORTED"
 NOTHING_TO_RECONCILE = "NOTHING_TO_RECONCILE"
+LOG_KEY_REQUIRED = "LOG_KEY_REQUIRED"
+
+_NO_LOG_KEY = "live writes need a signed action log; set %s" % LOG_KEY_ENV
 
 
 class PolicyReader(Protocol):
@@ -218,6 +222,9 @@ class Applier:
 
         if self._audit is None and not self._safety.dry_run:
             return self._note(now, suggestion, REFUSED, "no audit source configured to re-check the evidence")
+
+        if not self._store.keyed and not self._safety.dry_run:
+            return self._note(now, suggestion, LOG_KEY_REQUIRED, _NO_LOG_KEY)
 
         try:
             live = self._reader.get_policy(proposal.policy_id)
@@ -406,6 +413,9 @@ class Applier:
 
         if self._safety.dry_run:
             return self._note(now, suggestion, DRY_RUN, "dry run; rollback not performed", details, actor=actor)
+
+        if not self._store.keyed:
+            return self._note(now, suggestion, LOG_KEY_REQUIRED, _NO_LOG_KEY, details, actor=actor)
 
         write_error = None
         try:

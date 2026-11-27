@@ -28,7 +28,7 @@ Status: early development. Implemented so far:
 - three deterministic detectors: over-privileged grants, stale policies, abnormal access time
 - a replay harness and a synthetic scenario with planted anomalies and ground truth
 - an optional LLM explanation layer: pseudonymized input, strict output validation, deterministic fallback
-- a suggestion store with an append-only, hash-chained action log
+- a suggestion store with an append-only, hash-chained action log, signed with HMAC when a key is set
 - human approval, guarded apply with read-back verification, and rollback (dry run by default)
 - a command-line workflow and a read-only HTML "AI Insights" report
 - a read-only "AI Insights" page in the Ranger Admin UI for system administrators
@@ -99,6 +99,7 @@ pytest
 | `RANGER_AI_LLM_PROVIDER` | `none` | `none`, `openai` (any OpenAI-compatible endpoint), or `ollama` |
 | `RANGER_AI_LLM_URL` / `RANGER_AI_LLM_MODEL` / `RANGER_AI_LLM_API_KEY` | unset | Model endpoint settings |
 | `RANGER_AI_ALLOW_EXTERNAL_LLM` | `false` | Required to use a non-local model endpoint (pseudonymized data leaves the host) |
+| `RANGER_AI_LOG_KEY` | unset | HMAC key (32+ characters) that signs the action log. Required for live `apply` and `rollback`; once a store is signed, every command that writes to it needs the key |
 | `RANGER_AI_PSEUDONYM_KEY` | random per process | HMAC key for pseudonyms sent to a model; set it for stable pseudonyms |
 | `RANGER_AI_SERVE_TOKEN` | unset | Bearer token (32+ characters) the `serve` command requires. `serve` refuses to start without it |
 
@@ -114,7 +115,7 @@ python -m ranger_ai_agent.cli apply                 # dry run unless RANGER_AI_D
 python -m ranger_ai_agent.cli rollback <id> --requester alice
 python -m ranger_ai_agent.cli reconcile <id> --reviewer alice  # settle a NEEDS_ATTENTION suggestion
 python -m ranger_ai_agent.cli report --output insights.html   # read-only HTML "AI Insights" page
-python -m ranger_ai_agent.cli verify-log
+python -m ranger_ai_agent.cli verify-log            # prints the head hash; keep a copy outside the store
 python -m ranger_ai_agent.cli serve                 # read-only JSON for the Ranger Admin page (needs RANGER_AI_SERVE_TOKEN)
 ```
 
@@ -186,7 +187,14 @@ page shows a short error, and the details are in the Ranger Admin log. See
   toward the daily cap.
 - Rollback restores the stored pre-change policy and refuses if the policy
   changed since the agent wrote it, unless it already matches the original.
-- The action log is append-only (database triggers) and hash-chained, so
-  `verify-log` detects edits made around the triggers.
+- The action log is append-only (database triggers) and hash-chained. With
+  `RANGER_AI_LOG_KEY` set, each entry is signed with HMAC-SHA256, so someone who
+  can write the database file but does not hold the key cannot edit an entry or
+  add one without `verify-log` failing. Without a key the chain is plain SHA-256,
+  which anyone with write access can recompute, and live writes are refused.
+  Signing starts with a `LOG_KEY_ENABLED` entry; older entries stay unsigned and
+  are still checked. Keep the key out of the store's host if you can, and keep
+  the head hash from `verify-log` elsewhere: a log rewritten from the start, or
+  cut short, is only caught by comparing it.
 - The read client is GET-only. Writes go through a separate client that can only
   update a policy.

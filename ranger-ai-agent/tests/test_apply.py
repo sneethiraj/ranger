@@ -31,7 +31,7 @@ from ranger_ai_agent.suggestions.models import (
     suggestion_id_for,
 )
 from ranger_ai_agent.suggestions.service import SuggestionService
-from ranger_ai_agent.suggestions.store import InvalidTransition, SuggestionStore
+from ranger_ai_agent.suggestions.store import InvalidTransition, LogKeyRequired, SuggestionStore
 from ranger_ai_agent.synthetic import build_scenario
 
 FIXED_CLOCK = datetime(2026, 6, 1, tzinfo=timezone.utc)
@@ -88,14 +88,17 @@ class FakeRanger:
         self.policies[policy_id]["version"] += 1
 
 
-def build_world(safety=None, approve=(SID_REMOVE, SID_DISABLE)):
+LOG_KEY = b"test-action-log-key-0123456789abcdef"
+
+
+def build_world(safety=None, approve=(SID_REMOVE, SID_DISABLE), log_key=LOG_KEY):
     sc = build_scenario()
     raw = {p["id"]: dict(copy.deepcopy(p), version=3) for p in sc.source.list_policies()}
     ranger = FakeRanger(raw.values())
     snap = SnapshotBuilder(sc.source, sc.source).build(sc.as_of)
     findings = run_detectors(snap, DetectorConfig())
 
-    store = SuggestionStore()
+    store = SuggestionStore(log_key=log_key)
     service = SuggestionService(store, safety=SafetyConfig(dry_run=True), clock=lambda: FIXED_CLOCK)
     service.generate(snap, findings, copy.deepcopy(raw))
     for sid in approve:
@@ -607,3 +610,27 @@ def test_rollback_whose_read_back_failed_completes_on_the_next_try():
     assert applier.rollback(SID_REMOVE, "bob").outcome == ap.ROLLED_BACK
     assert store.get(SID_REMOVE).status == STATUS_ROLLED_BACK
     assert len(ranger.writes) == 3  # two applies and one rollback; the retry does not write again
+
+
+def test_live_apply_needs_a_signed_log():
+    store, ranger, applier, service, safety = build_world(log_key=None)
+    got = outcomes(applier.apply_approved())
+    assert got[SID_REMOVE] == got[SID_DISABLE] == ap.LOG_KEY_REQUIRED
+    assert ranger.writes == []
+    assert store.list_applications() == []
+
+
+def test_dry_run_does_not_need_a_log_key():
+    store, ranger, applier, service, safety = build_world(safety=SafetyConfig(dry_run=True), log_key=None)
+    assert set(outcomes(applier.apply_approved()).values()) == {ap.DRY_RUN}
+
+
+def test_rollback_writes_nothing_without_the_key():
+    store, ranger, applier, service, safety = build_world()
+    assert outcomes(applier.apply_approved())[SID_REMOVE] == ap.APPLIED
+    writes = len(ranger.writes)
+    keyless = SuggestionStore.__new__(SuggestionStore)  # the same rows, opened without the key
+    keyless._conn, keyless._key = store._conn, None
+    with pytest.raises(LogKeyRequired):
+        ap.Applier(keyless, ranger, ranger, safety=safety, clock=lambda: FIXED_CLOCK, audit=applier._audit).rollback(SID_REMOVE, "bob")
+    assert len(ranger.writes) == writes

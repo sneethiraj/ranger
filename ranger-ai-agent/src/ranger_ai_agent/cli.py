@@ -57,7 +57,7 @@ from ranger_ai_agent.report import render_insights
 from ranger_ai_agent.server import DEFAULT_PORT, INSIGHTS_PATH, TOKEN_ENV, make_server, validate_serve_settings
 from ranger_ai_agent.suggestions.apply import Applier
 from ranger_ai_agent.suggestions.service import SuggestionService
-from ranger_ai_agent.suggestions.store import SuggestionStore
+from ranger_ai_agent.suggestions.store import LOG_INTACT, LOG_KEY_ENV, LOG_UNVERIFIED, SuggestionStore, log_key_from_env
 from ranger_ai_agent.synthetic import build_scenario
 
 DEFAULT_STORE = "ranger-ai-suggestions.db"
@@ -190,7 +190,7 @@ def cmd_serve(args: argparse.Namespace, store: Optional[SuggestionStore], out) -
     token = validate_serve_settings(os.environ.get(TOKEN_ENV), args.host, args.allow_non_loopback)
     if not os.path.isfile(args.store):
         raise ValueError("store file not found: %s" % args.store)
-    server = make_server(args.host, args.port, args.store, token, SafetyConfig.from_env())
+    server = make_server(args.host, args.port, args.store, token, SafetyConfig.from_env(), log_key=log_key_from_env())
     print("serving read-only insights on http://%s:%d%s (Ctrl-C to stop)" % (args.host, server.server_port, INSIGHTS_PATH), file=out)
     try:
         server.serve_forever()
@@ -202,11 +202,20 @@ def cmd_serve(args: argparse.Namespace, store: Optional[SuggestionStore], out) -
 
 
 def cmd_verify_log(args: argparse.Namespace, store: SuggestionStore, out) -> int:
-    entries = len(store.log_entries())
-    if store.verify_log():
-        print("action log intact (%d entries)" % entries, file=out)
+    check = store.check_log()
+    if check.state == LOG_INTACT:
+        signing = "%d signed" % check.signed_entries if check.keyed else "not signed; set %s" % LOG_KEY_ENV
+        print("action log intact (%d entries, %s)" % (check.entries, signing), file=out)
+        print("head %s" % check.head, file=out)
         return EXIT_OK
-    print("error: action log FAILED verification (%d entries); the store may have been modified" % entries, file=sys.stderr)
+    if check.state == LOG_UNVERIFIED:
+        print("error: %s" % check.reason, file=sys.stderr)
+        return EXIT_FAILED
+    print(
+        "error: action log FAILED verification (%d entries): %s; the store may have been modified, "
+        "or %s is not the key it was signed with" % (check.entries, check.reason, LOG_KEY_ENV),
+        file=sys.stderr,
+    )
     return EXIT_TAMPERED
 
 
@@ -267,7 +276,7 @@ def main(argv: Optional[Sequence[str]] = None, out: Any = None) -> int:
     try:
         if not getattr(args, "needs_store", True):
             return args.handler(args, None, out)
-        with SuggestionStore(args.store) as store:
+        with SuggestionStore(args.store, log_key=log_key_from_env()) as store:
             return args.handler(args, store, out)
     except KeyError as exc:
         print("error: %s" % (exc.args[0] if exc.args else exc), file=sys.stderr)

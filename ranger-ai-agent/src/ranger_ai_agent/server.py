@@ -62,7 +62,10 @@ def validate_serve_settings(token: Optional[str], host: str, allow_non_loopback:
     return token
 
 
-def make_server(host: str, port: int, store_path: str, token: str, safety: SafetyConfig) -> ThreadingHTTPServer:
+def make_server(
+    host: str, port: int, store_path: str, token: str, safety: SafetyConfig, log_key: Optional[bytes] = None
+) -> ThreadingHTTPServer:
+    """`log_key` lets the page report a signed action log as verified; without it, it shows as not verified."""
     expected = token.encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
@@ -98,7 +101,7 @@ def make_server(host: str, port: int, store_path: str, token: str, safety: Safet
                 self._error(401, "unauthorized", extra={"WWW-Authenticate": "Bearer"})
                 return
             try:
-                store = SuggestionStore(store_path, read_only=True)
+                store = SuggestionStore(store_path, read_only=True, log_key=log_key)
                 try:
                     payload = build_insights(store, safety, datetime.now(UTC))
                 finally:

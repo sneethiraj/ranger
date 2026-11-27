@@ -51,6 +51,28 @@ const asList = (value) => (Array.isArray(value) ? value : []);
 
 const LOAD_FAILED = "Unable to load AI Insights.";
 
+function logBadge(log) {
+  const state = log.state || (log.intact ? "intact" : "broken");
+
+  if (state === "intact") {
+    return {
+      variant: log.signed ? "success" : "warning",
+      text: `Action log intact (${show(log.entries)} entries, ${
+        log.signed ? "signed" : "not signed"
+      })`
+    };
+  }
+
+  if (state === "unverified") {
+    return {
+      variant: "warning",
+      text: "Action log is signed but was not verified: the agent has no key"
+    };
+  }
+
+  return { variant: "danger", text: "Action log failed verification" };
+}
+
 function errorMessage(error) {
   const status = error?.response?.status;
 
@@ -128,10 +150,8 @@ function ModeBanner({ data }) {
       <Badge bg="secondary" className="me-2">
         {`Max ${show(mode.max_changes_per_day)} changes/day`}
       </Badge>
-      <Badge bg={log.intact ? "success" : "danger"} className="me-2">
-        {log.intact
-          ? `Action log intact (${show(log.entries)} entries)`
-          : "Action log failed verification"}
+      <Badge bg={logBadge(log).variant} className="me-2">
+        {logBadge(log).text}
       </Badge>
       <span className="text-muted">{`Generated ${show(
         data.generated_at

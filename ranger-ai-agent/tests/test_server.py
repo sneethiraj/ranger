@@ -188,3 +188,22 @@ def test_serve_command_refuses_unsafe_settings(store_path, tmp_path, capsys, mon
     assert cli.main(["--store", missing, "serve"]) == 1
     assert "store file not found" in capsys.readouterr().err
     assert not os.path.exists(missing)  # serve must not create the store
+
+
+@pytest.mark.parametrize("serve_key, state, intact", [(None, "unverified", False), (b"s" * 32, "intact", True)])
+def test_signed_log_is_verified_only_with_the_key(tmp_path, monkeypatch, serve_key, state, intact):
+    path = str(tmp_path / "signed.db")
+    monkeypatch.setenv("RANGER_AI_LOG_KEY", "s" * 32)
+    assert cli.main(["--store", path, "suggest", "--synthetic"]) == 0
+    monkeypatch.delenv("RANGER_AI_LOG_KEY")
+    server = make_server("127.0.0.1", 0, path, TOKEN, SafetyConfig(), log_key=serve_key)
+    thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.02), daemon=True)
+    thread.start()
+    try:
+        _, body = request(server.server_port)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    log = json.loads(body)["action_log"]
+    assert (log["state"], log["intact"], log["signed"]) == (state, intact, True)

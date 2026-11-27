@@ -30,6 +30,7 @@ from ranger_ai_agent.synthetic import build_scenario
 NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
 SID_REMOVE = suggestion_id_for("OVER_PRIVILEGED", 1, "carol")
 SID_DISABLE = suggestion_id_for("STALE_POLICY", 9, None)
+LOG_KEY = b"test-action-log-key-0123456789abcdef"
 HOSTILE = '<script>alert("x")</script><img src=x onerror=alert(1)>'
 
 
@@ -70,7 +71,7 @@ def populated_store(provider=None, apply_removal=False):
     raw = {p["id"]: p for p in sc.source.list_policies()}
     snap = SnapshotBuilder(sc.source, sc.source).build(sc.as_of)
     findings = run_detectors(snap, DetectorConfig())
-    store = SuggestionStore()
+    store = SuggestionStore(log_key=LOG_KEY)
     service = SuggestionService(store, provider=provider, safety=SafetyConfig(dry_run=True), clock=lambda: NOW)
     service.generate(snap, findings, copy.deepcopy(raw))
     service.approve(SID_REMOVE, "alice")

@@ -35,7 +35,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from ranger_ai_agent.config import SafetyConfig
 from ranger_ai_agent.models import format_utc
 from ranger_ai_agent.suggestions.models import ACTION_DISABLE_POLICY, ACTION_REMOVE_USER, STATUS_PENDING, Suggestion
-from ranger_ai_agent.suggestions.store import SuggestionStore
+from ranger_ai_agent.suggestions.store import LOG_INTACT, LOG_UNVERIFIED, LogCheck, SuggestionStore
 
 STATUSES = ("PENDING", "APPROVED", "REJECTED", "APPLIED", "ROLLED_BACK", "EXPIRED", "NEEDS_ATTENTION")
 LOG_LIMIT = 50
@@ -68,6 +68,7 @@ def build_insights(store: SuggestionStore, safety: SafetyConfig, generated_at: d
         counts[s.status] = counts.get(s.status, 0) + 1
 
     entries = store.log_entries()
+    check = store.check_log()
     return {
         "schema": INSIGHTS_SCHEMA,
         "generated_at": format_utc(generated_at),
@@ -76,7 +77,7 @@ def build_insights(store: SuggestionStore, safety: SafetyConfig, generated_at: d
             "kill_switch": safety.kill_switch,
             "max_changes_per_day": safety.max_changes_per_day,
         },
-        "action_log": {"intact": store.verify_log(), "entries": len(entries)},
+        "action_log": {"intact": check.state == LOG_INTACT, "state": check.state, "signed": check.keyed, "entries": len(entries)},
         "counts": counts,
         "suggestions": [
             {
@@ -110,6 +111,16 @@ def build_insights(store: SuggestionStore, safety: SafetyConfig, generated_at: d
             for e in reversed(entries[-log_limit:])
         ],
     }
+
+
+def _log_state(check: LogCheck) -> str:
+    if check.state == LOG_INTACT and check.keyed:
+        return "<span class='ok'>intact</span> (signed)"
+    if check.state == LOG_INTACT:
+        return "<span class='ok'>intact</span> (not signed: set RANGER_AI_LOG_KEY so edits cannot be re-hashed)"
+    if check.state == LOG_UNVERIFIED:
+        return "<span class='bad'>not verified</span> (signed; this process has no key)"
+    return "<span class='bad'>FAILED verification</span>"
 
 
 def _e(value: Any) -> str:
@@ -227,7 +238,7 @@ def render_insights(store: SuggestionStore, safety: SafetyConfig, generated_at: 
     suggestions = store.list()
     applications = store.list_applications()
     entries = store.log_entries()
-    intact = store.verify_log()
+    check = store.check_log()
 
     counts = {status: 0 for status in STATUSES}
     for s in suggestions:
@@ -237,7 +248,7 @@ def render_insights(store: SuggestionStore, safety: SafetyConfig, generated_at: 
     others = [s for s in suggestions if s.status != STATUS_PENDING]
     mode = "dry run (no changes written)" if safety.dry_run else "live"
     kill = "ON: all agent actions stopped" if safety.kill_switch else "off"
-    chain = "<span class='ok'>intact</span>" if intact else "<span class='bad'>FAILED verification</span>"
+    chain = _log_state(check)
 
     parts = [
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>",
