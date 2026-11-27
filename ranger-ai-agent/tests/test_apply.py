@@ -22,6 +22,7 @@ from ranger_ai_agent.clients.ranger_admin import RangerApiError
 from ranger_ai_agent.config import SafetyConfig
 from ranger_ai_agent.detectors import DetectorConfig, run_detectors
 from ranger_ai_agent.features.snapshot import SnapshotBuilder
+from ranger_ai_agent.identity import AUTH_RANGER
 from ranger_ai_agent.suggestions import apply as ap
 from ranger_ai_agent.suggestions.models import (
     STATUS_APPLIED,
@@ -102,7 +103,7 @@ def build_world(safety=None, approve=(SID_REMOVE, SID_DISABLE), log_key=LOG_KEY)
     service = SuggestionService(store, safety=SafetyConfig(dry_run=True), clock=lambda: FIXED_CLOCK)
     service.generate(snap, findings, copy.deepcopy(raw))
     for sid in approve:
-        service.approve(sid, "alice")
+        service.approve(sid, "alice", AUTH_RANGER)
 
     safety = safety or SafetyConfig(kill_switch=False, dry_run=False, max_changes_per_day=5)
     applier = ap.Applier(store, ranger, ranger, safety=safety, clock=lambda: FIXED_CLOCK, audit=sc.source)
@@ -707,7 +708,7 @@ def test_approval_made_before_binding_must_be_renewed():
     store.log("2026-06-01T00:00:00Z", "alice", STATUS_APPROVED, SID_REMOVE, {})
     result = applier.apply_approved()
     assert outcomes(result)[SID_REMOVE] == ap.APPROVAL_UNVERIFIED and "run approve again" in result[0].detail
-    service.approve(SID_REMOVE, "alice")  # APPROVED -> APPROVED records a bound approval
+    service.approve(SID_REMOVE, "alice", AUTH_RANGER)  # APPROVED -> APPROVED records a bound approval
     assert outcomes(applier.apply_approved())[SID_REMOVE] == ap.APPLIED
 
 
@@ -719,14 +720,14 @@ def test_unsigned_approval_is_not_accepted_once_the_log_is_signed(tmp_path):
     with SuggestionStore(path) as unsigned:
         service = SuggestionService(unsigned, safety=SafetyConfig(dry_run=True), clock=lambda: FIXED_CLOCK)
         service.generate(snap, run_detectors(snap, DetectorConfig()), copy.deepcopy(raw))
-        service.approve(SID_REMOVE, "alice")
+        service.approve(SID_REMOVE, "alice", AUTH_RANGER)
     ranger = FakeRanger(raw.values())
     safety = SafetyConfig(kill_switch=False, dry_run=False, max_changes_per_day=5)
     with SuggestionStore(path, log_key=LOG_KEY) as store:
         applier = ap.Applier(store, ranger, ranger, safety=safety, clock=lambda: FIXED_CLOCK, audit=sc.source)
         result = applier.apply_approved()
         assert outcomes(result)[SID_REMOVE] == ap.APPROVAL_UNVERIFIED and "signed" in result[0].detail
-        SuggestionService(store, clock=lambda: FIXED_CLOCK).approve(SID_REMOVE, "alice")
+        SuggestionService(store, clock=lambda: FIXED_CLOCK).approve(SID_REMOVE, "alice", AUTH_RANGER)
         assert outcomes(applier.apply_approved())[SID_REMOVE] == ap.APPLIED
 
 
@@ -748,3 +749,13 @@ def test_approval_digest_is_recorded_and_reset_by_a_new_proposal():
     assert entry["actor"] == "alice" and entry["hash_alg"] == "hmac-sha256"
     assert entry["details"]["proposal_sha256"] == ap.proposal_digest(store.get(SID_REMOVE))
     assert store.approval_entry(SID_DISABLE) is None
+
+
+def test_approval_without_a_ranger_confirmed_reviewer_is_not_applied():
+    store, ranger, applier, service, safety = build_world(approve=())
+    service.approve(SID_REMOVE, "alice")  # default: identity not checked
+    result = applier.apply_approved()
+    assert outcomes(result)[SID_REMOVE] == ap.APPROVAL_UNVERIFIED and "not confirmed with Ranger" in result[0].detail
+    assert ranger.writes == []
+    service.approve(SID_REMOVE, "alice", AUTH_RANGER)
+    assert outcomes(applier.apply_approved())[SID_REMOVE] == ap.APPLIED

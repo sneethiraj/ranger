@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from ranger_ai_agent.config import SafetyConfig
 from ranger_ai_agent.detectors import DetectorConfig, run_detectors
 from ranger_ai_agent.features.snapshot import SnapshotBuilder
+from ranger_ai_agent.identity import AUTH_RANGER
 from ranger_ai_agent.report import build_insights, change_summary, render_insights
 from ranger_ai_agent.suggestions.apply import Applier
 from ranger_ai_agent.suggestions.models import ACTION_DISABLE_POLICY, suggestion_id_for
@@ -74,7 +75,7 @@ def populated_store(provider=None, apply_removal=False):
     store = SuggestionStore(log_key=LOG_KEY)
     service = SuggestionService(store, provider=provider, safety=SafetyConfig(dry_run=True), clock=lambda: NOW)
     service.generate(snap, findings, copy.deepcopy(raw))
-    service.approve(SID_REMOVE, "alice")
+    service.approve(SID_REMOVE, "alice", AUTH_RANGER)
     if apply_removal:
         ranger = FakeRanger(sc.source.list_policies())
         Applier(store, ranger, ranger, safety=SafetyConfig(dry_run=False), clock=lambda: NOW, audit=sc.source).apply_approved()

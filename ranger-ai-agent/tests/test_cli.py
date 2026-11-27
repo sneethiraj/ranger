@@ -23,6 +23,7 @@ import pytest
 from ranger_ai_agent import cli
 from ranger_ai_agent.clients.ranger_admin import RangerApiError
 from ranger_ai_agent.clients.solr_audit import SolrAuditError
+from ranger_ai_agent.identity import AUTH_RANGER, Reviewer
 from ranger_ai_agent.suggestions.models import suggestion_id_for
 from ranger_ai_agent.synthetic import build_scenario
 
@@ -61,6 +62,12 @@ def store_path(tmp_path):
 @pytest.fixture(autouse=True)
 def log_key(monkeypatch):
     monkeypatch.setenv("RANGER_AI_LOG_KEY", "test-action-log-key-0123456789abcdef")
+
+
+@pytest.fixture(autouse=True)
+def ranger_confirms_reviewers(monkeypatch):
+    """Stand in for Ranger Admin's profile check: every typed login is confirmed."""
+    monkeypatch.setattr(cli, "reviewer_from_env", lambda config, login: Reviewer(login.strip(), AUTH_RANGER))
 
 
 @pytest.fixture
@@ -285,3 +292,41 @@ def test_reconcile_settles_a_write_that_needs_attention(store_path, capsys, rang
     assert "APPLIED" in capsys.readouterr().out
     run(store_path, "list", "--status", "APPLIED")
     assert "1 suggestion(s)" in capsys.readouterr().out
+
+
+def test_reviewer_identity_is_checked_and_logged(store_path, capsys, monkeypatch):
+    checked = []
+
+    def confirm(config, login):
+        checked.append(login)
+        return Reviewer("Alice", AUTH_RANGER)  # Ranger's spelling of the login is what is recorded
+
+    monkeypatch.setattr(cli, "reviewer_from_env", confirm)
+    assert run(store_path, "suggest", "--synthetic") == 0
+    assert run(store_path, "approve", SID_REMOVE, "--reviewer", "alice") == 0
+    assert "APPROVED by Alice" in capsys.readouterr().out
+    assert checked == ["alice"]
+    with cli.SuggestionStore(store_path, log_key=b"test-action-log-key-0123456789abcdef") as store:
+        actions = [(e["action"], e["actor"], e["details"].get("auth")) for e in store.log_entries()[-2:]]
+    assert actions == [("IDENTITY_CHECKED", "Alice", "ranger"), ("APPROVED", "Alice", "ranger")]
+
+
+def test_failed_identity_check_changes_nothing(store_path, capsys, monkeypatch):
+    from ranger_ai_agent.identity import ReviewerAuthError
+
+    def refuse(config, login):
+        raise ReviewerAuthError("Ranger Admin did not accept the credentials for %s" % login)
+
+    monkeypatch.setattr(cli, "reviewer_from_env", refuse)
+    assert run(store_path, "suggest", "--synthetic") == 0
+    assert run(store_path, "approve", SID_REMOVE, "--reviewer", "alice") == 1
+    assert "did not accept" in capsys.readouterr().err
+    assert run(store_path, "list", "--status", "APPROVED") == 0
+    assert "0 suggestion(s)" in capsys.readouterr().out
+
+
+def test_unverified_mode_warns(store_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "reviewer_from_env", lambda config, login: Reviewer(login, "unverified"))
+    assert run(store_path, "suggest", "--synthetic") == 0
+    assert run(store_path, "approve", SID_REMOVE, "--reviewer", "alice") == 0
+    assert "was not confirmed with Ranger" in capsys.readouterr().err

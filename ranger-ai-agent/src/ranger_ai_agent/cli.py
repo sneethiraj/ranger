@@ -51,8 +51,9 @@ from ranger_ai_agent.clients.solr_audit import SolrAuditReader
 from ranger_ai_agent.config import RangerConfig, SafetyConfig, SolrConfig
 from ranger_ai_agent.detectors import DetectorConfig, run_detectors
 from ranger_ai_agent.features.snapshot import SnapshotBuilder
+from ranger_ai_agent.identity import AUTH_RANGER, REVIEWER_AUTH_ENV, Reviewer, reviewer_from_env
 from ranger_ai_agent.llm.providers import provider_from_env
-from ranger_ai_agent.models import UTC
+from ranger_ai_agent.models import UTC, format_utc
 from ranger_ai_agent.report import render_insights
 from ranger_ai_agent.server import DEFAULT_PORT, INSIGHTS_PATH, TOKEN_ENV, make_server, validate_serve_settings
 from ranger_ai_agent.suggestions.apply import Applier
@@ -138,12 +139,24 @@ def cmd_show(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     return EXIT_OK
 
 
+def confirm_person(store: SuggestionStore, login: str, command: str, suggestion_id: str) -> Reviewer:
+    """Check who is acting, as RANGER_AI_REVIEWER_AUTH says, and log the result."""
+    reviewer = reviewer_from_env(RangerConfig.from_env(), login)
+    if reviewer.auth != AUTH_RANGER:
+        print("warning: %s was not confirmed with Ranger (%s=none)" % (reviewer.login, REVIEWER_AUTH_ENV), file=sys.stderr)
+    store.log(
+        format_utc(datetime.now(UTC)), reviewer.login, "IDENTITY_CHECKED", suggestion_id, {"command": command, "auth": reviewer.auth}
+    )
+    return reviewer
+
+
 def cmd_review(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     service = SuggestionService(store)
+    reviewer = confirm_person(store, args.reviewer, args.command, args.suggestion_id)
     if args.command == "approve":
-        suggestion = service.approve(args.suggestion_id, args.reviewer)
+        suggestion = service.approve(args.suggestion_id, reviewer.login, reviewer.auth)
     else:
-        suggestion = service.reject(args.suggestion_id, args.reviewer)
+        suggestion = service.reject(args.suggestion_id, reviewer.login, reviewer.auth)
     print("%s %s by %s" % (suggestion.suggestion_id, suggestion.status, suggestion.reviewed_by), file=out)
     return EXIT_OK
 
@@ -162,14 +175,18 @@ def cmd_apply(args: argparse.Namespace, store: SuggestionStore, out) -> int:
 
 def cmd_rollback(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     reader, writer = build_ranger_clients()
-    result = Applier(store, reader, writer, safety=SafetyConfig.from_env()).rollback(args.suggestion_id, args.requester)
+    requester = confirm_person(store, args.requester, "rollback", args.suggestion_id)
+    result = Applier(store, reader, writer, safety=SafetyConfig.from_env()).rollback(args.suggestion_id, requester.login)
     print("%-20s %-16s %s" % (result.suggestion_id, result.outcome, result.detail), file=out)
     return EXIT_OK
 
 
 def cmd_reconcile(args: argparse.Namespace, store: SuggestionStore, out) -> int:
     reader, writer = build_ranger_clients()
-    result = Applier(store, reader, writer, safety=SafetyConfig.from_env()).reconcile(args.suggestion_id, args.reviewer)
+    reviewer = confirm_person(store, args.reviewer, "reconcile", args.suggestion_id)
+    result = Applier(store, reader, writer, safety=SafetyConfig.from_env()).reconcile(
+        args.suggestion_id, reviewer.login, reviewer.auth
+    )
     print("%-20s %-16s %s" % (result.suggestion_id, result.outcome, result.detail), file=out)
     return EXIT_OK
 
@@ -239,7 +256,7 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("approve", "reject"):
         p = sub.add_parser(name, help="%s a pending suggestion" % name)
         p.add_argument("suggestion_id")
-        p.add_argument("--reviewer", required=True, help="name of the person making the decision")
+        p.add_argument("--reviewer", required=True, help="Ranger login of the person making the decision")
         p.set_defaults(handler=cmd_review)
 
     p = sub.add_parser("apply", help="apply approved suggestions (dry run unless RANGER_AI_DRY_RUN=0)")
@@ -247,12 +264,12 @@ def _parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("rollback", help="restore the policy an applied suggestion changed")
     p.add_argument("suggestion_id")
-    p.add_argument("--requester", required=True, help="name of the person requesting the rollback")
+    p.add_argument("--requester", required=True, help="Ranger login of the person requesting the rollback")
     p.set_defaults(handler=cmd_rollback)
 
     p = sub.add_parser("reconcile", help="settle a NEEDS_ATTENTION suggestion from the live policy")
     p.add_argument("suggestion_id")
-    p.add_argument("--reviewer", required=True, help="name of the person who inspected the policy")
+    p.add_argument("--reviewer", required=True, help="Ranger login of the person who inspected the policy")
     p.set_defaults(handler=cmd_reconcile)
 
     p = sub.add_parser("report", help="write a read-only HTML insights page")

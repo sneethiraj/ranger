@@ -117,9 +117,12 @@ the deterministic text.
 - Every `suggest` run expires the PENDING and APPROVED suggestions whose finding
   it did not detect, or now refuses. A finding that returns reopens its
   suggestion as PENDING, without the old approval.
-- Approve (named human; the APPROVED log entry records the SHA-256 of the
+- Approve (a person confirmed with Ranger Admin: their own credentials are sent
+  to `GET /service/users/profile`, the returned `loginId` is recorded, and it
+  must hold `ROLE_SYS_ADMIN` and differ from the agent's account. The
+  APPROVED entry records `auth: ranger` and the SHA-256 of the
   suggestion id, evidence time and proposal) -> require the action log to verify,
-  and the latest approval to be signed, by a person, and to match the stored
+  and the latest approval to be signed, confirmed with Ranger, and to match the stored
   proposal (`APPROVAL_UNVERIFIED` otherwise; rollback checks this too, since it
   writes the stored original) -> re-validate against current protections -> require
   a detection run within `max_evidence_age_hours` -> read the live policy and
@@ -176,7 +179,7 @@ the deterministic text.
 
 ## 10. Implementation status
 
-Implemented on `ranger_5278` and covered by unit tests (279 Python, 24 Java),
+Implemented on `ranger_5278` and covered by unit tests (296 Python, 24 Java),
 with planted-anomaly accuracy measured on synthetic data only:
 
 - read-only Ranger and Solr clients; a GET-only reader and a separate PUT-only writer
@@ -191,6 +194,11 @@ Known gaps:
 
 - Not tested against a live Ranger or Solr instance. The write path's assumptions
   about Ranger's update behavior come from reading the server source, not from a run.
+- Reviewer checks use HTTP basic authentication against `/service/users/profile`,
+  read from the Ranger source, not tried against a running server. Kerberos and
+  SSO-only deployments cannot confirm reviewers yet. Anyone who holds both the
+  log key and write access to the store can still forge approvals; keep the key
+  away from people who only review.
 - Group and role grants are not evaluated. Only direct user grants are checked.
 - The suggestion id is not written into the policy's description, as the apply
   step above once proposed.

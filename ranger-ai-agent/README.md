@@ -101,6 +101,8 @@ pytest
 | `RANGER_AI_ALLOW_EXTERNAL_LLM` | `false` | Required to use a non-local model endpoint (pseudonymized data leaves the host) |
 | `RANGER_AI_LOG_KEY` | unset | HMAC key (32+ characters) that signs the action log. Required for live `apply` and `rollback`; once a store is signed, every command that writes to it needs the key |
 | `RANGER_AI_PSEUDONYM_KEY` | random per process | HMAC key for pseudonyms sent to a model; set it for stable pseudonyms |
+| `RANGER_AI_REVIEWER_AUTH` | `ranger` | How `approve`, `reject`, `reconcile` and `rollback` confirm who is acting: `ranger` checks the person's own login with Ranger Admin; `none` records the typed name as unverified (demos only: such approvals are never applied) |
+| `RANGER_AI_REVIEWER_PASSWORD` | unset | The reviewer's Ranger password for scripted use; otherwise it is asked for at the terminal |
 | `RANGER_AI_SERVE_TOKEN` | unset | Bearer token (32+ characters) the `serve` command requires. `serve` refuses to start without it |
 
 ## Command line
@@ -110,7 +112,7 @@ export PYTHONPATH=src
 python -m ranger_ai_agent.cli suggest --synthetic   # or `suggest` with live Ranger and Solr
 python -m ranger_ai_agent.cli list --status PENDING
 python -m ranger_ai_agent.cli show <id>
-python -m ranger_ai_agent.cli approve <id> --reviewer alice
+python -m ranger_ai_agent.cli approve <id> --reviewer alice   # asks for alice's Ranger password
 python -m ranger_ai_agent.cli apply                 # dry run unless RANGER_AI_DRY_RUN=0
 python -m ranger_ai_agent.cli rollback <id> --requester alice
 python -m ranger_ai_agent.cli reconcile <id> --reviewer alice  # settle a NEEDS_ATTENTION suggestion
@@ -171,6 +173,14 @@ page shows a short error, and the details are in the Ranger Admin log. See
 - Each `suggest` run expires every pending or approved suggestion whose finding
   it no longer detects, or now refuses. If the finding comes back, the suggestion
   reopens as `PENDING` and needs a new approval.
+- `--reviewer` and `--requester` are Ranger logins. The agent sends that
+  person's own password to Ranger Admin (`GET /service/users/profile`) and
+  records the login Ranger returns, which must hold `ROLE_SYS_ADMIN` and must
+  not be the agent's service account. Only approvals confirmed this way are
+  applied. Only basic authentication is supported, so a Ranger Admin that
+  accepts only Kerberos or SSO cannot confirm reviewers yet. With
+  `RANGER_AI_REVIEWER_AUTH=none` (try it with `--synthetic`), the typed name
+  is recorded as unverified and `apply` refuses those approvals.
 - An approval is a signed log entry that records the SHA-256 of the exact
   proposal approved. Before any write or rollback, the applier requires the log
   to verify, and the latest approval of the suggestion to be by a person, signed,

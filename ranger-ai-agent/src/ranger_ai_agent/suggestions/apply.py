@@ -55,6 +55,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol
 from ranger_ai_agent.clients.ranger_admin import RangerApiError
 from ranger_ai_agent.clients.solr_audit import SolrAuditError
 from ranger_ai_agent.config import SafetyConfig
+from ranger_ai_agent.identity import AUTH_RANGER, REVIEWER_AUTH_ENV
 from ranger_ai_agent.models import UTC, format_utc, parse_utc
 from ranger_ai_agent.sources import AuditSource
 from ranger_ai_agent.suggestions.models import (
@@ -349,6 +350,11 @@ class Applier:
             return "the approval was recorded before approvals were bound to proposals; run approve again"
         if recorded != proposal_digest(suggestion):
             return "the stored proposal is not the one that was approved"
+        if entry["details"].get("auth") != AUTH_RANGER:
+            return "the approver %r was not confirmed with Ranger; approve again with %s=ranger" % (
+                entry["actor"],
+                REVIEWER_AUTH_ENV,
+            )
         if self._store.keyed and entry["hash_alg"] != ALG_HMAC:
             return "the approval is not a signed log entry; run approve again with %s set" % LOG_KEY_ENV
         return None
@@ -486,13 +492,15 @@ class Applier:
         )
         return ApplyResult(suggestion_id, ROLLED_BACK, "policy %s restored" % policy_id)
 
-    def reconcile(self, suggestion_id: str, reviewer: str) -> ApplyResult:
+    def reconcile(self, suggestion_id: str, reviewer: str, auth: Optional[str] = None) -> ApplyResult:
         """Settle a NEEDS_ATTENTION suggestion from the live policy. Requires a named human.
 
         Matches the proposal: APPLIED. Matches the original: the attempt is ABORTED and
         the suggestion goes back to APPROVED. Matches neither: its current version is
         recorded, so that rollback can restore the original once a person has inspected it.
         Ranger is only read, so this is allowed while the kill switch is on.
+        `auth` is how the reviewer was checked; a suggestion it moves back to
+        APPROVED counts as approved by them.
         """
         actor = _require_human(reviewer)
         now = self._now()
@@ -519,7 +527,13 @@ class Applier:
 
         if _same_effect(live, proposal.before):
             self._store.abort_application(
-                application["application_id"], suggestion_id, now, actor, ABORTED, {"live_version": version}, reopen=True
+                application["application_id"],
+                suggestion_id,
+                now,
+                actor,
+                ABORTED,
+                {"live_version": version, "auth": auth},
+                reopen=True,
             )
             return ApplyResult(
                 suggestion_id, ABORTED, "policy %s matches the original; the suggestion is APPROVED again" % proposal.policy_id

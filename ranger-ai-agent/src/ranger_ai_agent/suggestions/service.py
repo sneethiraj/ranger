@@ -39,6 +39,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 from ranger_ai_agent.config import SafetyConfig
 from ranger_ai_agent.detectors.core import Finding
 from ranger_ai_agent.features.snapshot import FeatureSnapshot
+from ranger_ai_agent.identity import AUTH_UNVERIFIED
 from ranger_ai_agent.llm.explain import (
     Explanation,
     ExplanationError,
@@ -230,13 +231,14 @@ class SuggestionService:
         )
         return restored, self._provider.name, True
 
-    def approve(self, suggestion_id: str, reviewer: str) -> Suggestion:
-        return self._review(suggestion_id, STATUS_APPROVED, reviewer)
+    def approve(self, suggestion_id: str, reviewer: str, auth: str = AUTH_UNVERIFIED) -> Suggestion:
+        """`auth` says how the reviewer's identity was checked; only AUTH_RANGER approvals are applied."""
+        return self._review(suggestion_id, STATUS_APPROVED, reviewer, auth)
 
-    def reject(self, suggestion_id: str, reviewer: str) -> Suggestion:
-        return self._review(suggestion_id, STATUS_REJECTED, reviewer)
+    def reject(self, suggestion_id: str, reviewer: str, auth: str = AUTH_UNVERIFIED) -> Suggestion:
+        return self._review(suggestion_id, STATUS_REJECTED, reviewer, auth)
 
-    def _review(self, suggestion_id: str, new_status: str, reviewer: str) -> Suggestion:
+    def _review(self, suggestion_id: str, new_status: str, reviewer: str, auth: str) -> Suggestion:
         if not reviewer or not reviewer.strip() or reviewer.strip().lower() == AGENT:
             raise ValueError("a named human reviewer is required")
-        return self._store.transition(suggestion_id, new_status, reviewer.strip(), self._now())
+        return self._store.transition(suggestion_id, new_status, reviewer.strip(), self._now(), {"auth": auth})
