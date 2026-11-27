@@ -634,3 +634,117 @@ def test_rollback_writes_nothing_without_the_key():
     with pytest.raises(LogKeyRequired):
         ap.Applier(keyless, ranger, ranger, safety=safety, clock=lambda: FIXED_CLOCK, audit=applier._audit).rollback(SID_REMOVE, "bob")
     assert len(ranger.writes) == writes
+
+
+# --- approvals are read from the signed log, not from the status column ---
+
+import json as _json  # noqa: E402
+
+from ranger_ai_agent.suggestions import store as st  # noqa: E402
+
+
+def _edit_row(store, sid, status=None, after=None, before=None):
+    """Change a suggestion row directly, as someone who can write the database file could."""
+    data = store.get(sid).to_dict()
+    if status:
+        data["status"] = status
+    if after is not None:
+        data["proposal"]["after"] = after
+    if before is not None:
+        data["proposal"]["before"] = before
+    store._conn.execute(
+        "UPDATE suggestions SET status = ?, payload = ? WHERE suggestion_id = ?",
+        (data["status"], _json.dumps(data, sort_keys=True), sid),
+    )
+    store._conn.commit()
+
+
+def test_status_set_to_approved_in_the_database_is_not_applied():
+    store, ranger, applier, service, safety = build_world(approve=(SID_REMOVE,))
+    _edit_row(store, SID_DISABLE, status=STATUS_APPROVED)
+    got = outcomes(applier.apply_approved())
+    assert got[SID_REMOVE] == ap.APPLIED
+    assert got[SID_DISABLE] == ap.APPROVAL_UNVERIFIED
+    assert [w[0] for w in ranger.writes] == [1]
+
+
+def test_proposal_edited_after_approval_is_not_applied():
+    store, ranger, applier, service, safety = build_world(approve=(SID_REMOVE,))
+    # Retarget the removal from carol to bob. It passes validation, but it is not what alice approved.
+    data = store.get(SID_REMOVE).to_dict()
+    proposal = data["proposal"]
+    proposal["target_user"] = "bob"
+    proposal["after"] = copy.deepcopy(proposal["before"])
+    proposal["after"]["policyItems"][0]["users"].remove("bob")
+    assert ap.validate_proposal(ap.Suggestion.from_dict(data).proposal, safety.protected_policy_ids) == []
+    store._conn.execute("UPDATE suggestions SET payload = ? WHERE suggestion_id = ?", (_json.dumps(data, sort_keys=True), SID_REMOVE))
+    result = applier.apply_approved()
+    assert outcomes(result)[SID_REMOVE] == ap.APPROVAL_UNVERIFIED
+    assert "not the one that was approved" in result[0].detail
+    assert ranger.writes == []
+
+
+def test_forged_unsigned_approval_entry_blocks_every_write():
+    store, ranger, applier, service, safety = build_world(approve=(SID_REMOVE,))
+    _edit_row(store, SID_DISABLE, status=STATUS_APPROVED)
+    last = store.log_entries()[-1]["entry_hash"]
+    details = {"proposal_sha256": ap.proposal_digest(store.get(SID_DISABLE))}
+    h = st._entry_hash(last, "2026-06-01T00:00:00Z", "alice", STATUS_APPROVED, SID_DISABLE, st._canonical(details))
+    store._conn.execute(
+        "INSERT INTO action_log (ts, actor, action, suggestion_id, details, prev_hash, entry_hash, hash_alg) "
+        "VALUES (?, 'alice', 'APPROVED', ?, ?, ?, ?, 'sha256')",
+        ("2026-06-01T00:00:00Z", SID_DISABLE, st._canonical(details), last, h),
+    )
+    got = outcomes(applier.apply_approved())
+    assert set(got.values()) == {ap.APPROVAL_UNVERIFIED}
+    assert ranger.writes == []
+
+
+def test_approval_made_before_binding_must_be_renewed():
+    store, ranger, applier, service, safety = build_world(approve=())
+    # An approval as recorded by earlier versions: a signed APPROVED entry with no digest.
+    _edit_row(store, SID_REMOVE, status=STATUS_APPROVED)
+    store.log("2026-06-01T00:00:00Z", "alice", STATUS_APPROVED, SID_REMOVE, {})
+    result = applier.apply_approved()
+    assert outcomes(result)[SID_REMOVE] == ap.APPROVAL_UNVERIFIED and "run approve again" in result[0].detail
+    service.approve(SID_REMOVE, "alice")  # APPROVED -> APPROVED records a bound approval
+    assert outcomes(applier.apply_approved())[SID_REMOVE] == ap.APPLIED
+
+
+def test_unsigned_approval_is_not_accepted_once_the_log_is_signed(tmp_path):
+    path = str(tmp_path / "s.db")
+    sc = build_scenario()
+    raw = {p["id"]: dict(copy.deepcopy(p), version=3) for p in sc.source.list_policies()}
+    snap = SnapshotBuilder(sc.source, sc.source).build(sc.as_of)
+    with SuggestionStore(path) as unsigned:
+        service = SuggestionService(unsigned, safety=SafetyConfig(dry_run=True), clock=lambda: FIXED_CLOCK)
+        service.generate(snap, run_detectors(snap, DetectorConfig()), copy.deepcopy(raw))
+        service.approve(SID_REMOVE, "alice")
+    ranger = FakeRanger(raw.values())
+    safety = SafetyConfig(kill_switch=False, dry_run=False, max_changes_per_day=5)
+    with SuggestionStore(path, log_key=LOG_KEY) as store:
+        applier = ap.Applier(store, ranger, ranger, safety=safety, clock=lambda: FIXED_CLOCK, audit=sc.source)
+        result = applier.apply_approved()
+        assert outcomes(result)[SID_REMOVE] == ap.APPROVAL_UNVERIFIED and "signed" in result[0].detail
+        SuggestionService(store, clock=lambda: FIXED_CLOCK).approve(SID_REMOVE, "alice")
+        assert outcomes(applier.apply_approved())[SID_REMOVE] == ap.APPLIED
+
+
+def test_rollback_refuses_an_edited_original():
+    store, ranger, applier, service, safety = build_world(approve=(SID_REMOVE,))
+    assert outcomes(applier.apply_approved())[SID_REMOVE] == ap.APPLIED
+    writes = len(ranger.writes)
+    tampered = copy.deepcopy(store.get(SID_REMOVE).proposal.before)
+    tampered["policyItems"][0]["users"].append("mallory")
+    _edit_row(store, SID_REMOVE, before=tampered)
+    result = applier.rollback(SID_REMOVE, "bob")
+    assert result.outcome == ap.APPROVAL_UNVERIFIED
+    assert len(ranger.writes) == writes
+
+
+def test_approval_digest_is_recorded_and_reset_by_a_new_proposal():
+    store, ranger, applier, service, safety = build_world(approve=(SID_REMOVE,))
+    entry = store.approval_entry(SID_REMOVE)
+    assert entry["actor"] == "alice" and entry["hash_alg"] == "hmac-sha256"
+    assert entry["details"]["proposal_sha256"] == ap.proposal_digest(store.get(SID_REMOVE))
+    assert store.approval_entry(SID_DISABLE) is None

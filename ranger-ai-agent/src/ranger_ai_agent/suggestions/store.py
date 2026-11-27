@@ -61,6 +61,7 @@ from ranger_ai_agent.suggestions.models import (
     STATUS_REJECTED,
     STATUS_ROLLED_BACK,
     Suggestion,
+    proposal_digest,
 )
 
 GENESIS = "GENESIS"
@@ -80,7 +81,8 @@ LOG_BROKEN = "broken"
 # NEEDS_ATTENTION is never expired: the policy may already have been changed.
 _VALID_TRANSITIONS = {
     STATUS_PENDING: frozenset({STATUS_APPROVED, STATUS_REJECTED, STATUS_EXPIRED}),
-    STATUS_APPROVED: frozenset({STATUS_APPLIED, STATUS_EXPIRED, STATUS_NEEDS_ATTENTION}),
+    # APPROVED -> APPROVED is a fresh approval, for example of one made before approvals were bound to proposals.
+    STATUS_APPROVED: frozenset({STATUS_APPROVED, STATUS_APPLIED, STATUS_EXPIRED, STATUS_NEEDS_ATTENTION}),
     STATUS_APPLIED: frozenset({STATUS_ROLLED_BACK}),
     STATUS_NEEDS_ATTENTION: frozenset({STATUS_APPLIED, STATUS_APPROVED, STATUS_ROLLED_BACK}),
 }
@@ -101,6 +103,8 @@ _APPLICATION_COLUMNS = (
 # Statuses that expire_missing() may close.
 _EXPIRABLE = (STATUS_PENDING, STATUS_APPROVED)
 _HUMAN_REVIEW_STATUSES = frozenset({STATUS_APPROVED, STATUS_REJECTED})
+# Log actions that start or end what an approval can refer to.
+_APPROVAL_RESETS = frozenset({"CREATED", "REFRESHED", "REOPENED", STATUS_REJECTED, STATUS_EXPIRED})
 
 # applied_at is when the attempt started. version_after is unknown until the write is confirmed.
 _APPLICATIONS_DDL = """
@@ -619,6 +623,24 @@ class SuggestionStore:
             for r in rows
         ]
 
+    def approval_entry(self, suggestion_id: str) -> Optional[Dict[str, Any]]:
+        """The log entry of the approval that covers this suggestion's current proposal, or None.
+
+        That is the latest APPROVED entry since the proposal was last written, and
+        not followed by a rejection or expiry.
+        """
+        rows = self._conn.execute(
+            "SELECT log_id, ts, actor, action, details, hash_alg FROM action_log WHERE suggestion_id = ? ORDER BY log_id",
+            (suggestion_id,),
+        ).fetchall()
+        found: Optional[Dict[str, Any]] = None
+        for log_id, ts, actor, action, details, alg in rows:
+            if action in _APPROVAL_RESETS:
+                found = None
+            elif action == STATUS_APPROVED:
+                found = {"log_id": log_id, "ts": ts, "actor": actor, "details": json.loads(details), "hash_alg": alg}
+        return found
+
     def verify_log(self) -> bool:
         """True only if every entry, signed or not, checks out."""
         return self.check_log().state == LOG_INTACT
@@ -679,6 +701,8 @@ class SuggestionStore:
         if new_status not in _VALID_TRANSITIONS.get(current.status, frozenset()):
             raise InvalidTransition("cannot move suggestion from %s to %s" % (current.status, new_status))
 
+        if new_status == STATUS_APPROVED:
+            details = dict(details, proposal_sha256=proposal_digest(current))
         changes: Dict[str, Any] = {"status": new_status}
         if new_status in _HUMAN_REVIEW_STATUSES:
             changes.update(reviewed_by=actor, reviewed_at=now)

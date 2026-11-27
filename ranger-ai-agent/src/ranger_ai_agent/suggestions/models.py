@@ -23,6 +23,7 @@ original. Proposals are built by deterministic code, never by a model.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -52,6 +53,16 @@ def suggestion_id_for(kind: str, policy_id: Optional[int], user: Optional[str]) 
     """One open suggestion per (kind, policy, user), so daily reruns refresh instead of duplicating."""
     raw = "%s|%s|%s" % (kind, "" if policy_id is None else policy_id, user or "")
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def proposal_digest(suggestion: "Suggestion") -> str:
+    """SHA-256 of what an approval covers: the suggestion, its evidence time, and the exact change.
+
+    Recorded in the APPROVED log entry and checked again before any write, so a
+    proposal edited in the store after approval is not applied.
+    """
+    material = {"suggestion_id": suggestion.suggestion_id, "as_of": suggestion.as_of, "proposal": suggestion.proposal.to_dict()}
+    return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

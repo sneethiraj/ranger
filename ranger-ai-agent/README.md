@@ -171,6 +171,12 @@ page shows a short error, and the details are in the Ranger Admin log. See
 - Each `suggest` run expires every pending or approved suggestion whose finding
   it no longer detects, or now refuses. If the finding comes back, the suggestion
   reopens as `PENDING` and needs a new approval.
+- An approval is a signed log entry that records the SHA-256 of the exact
+  proposal approved. Before any write or rollback, the applier requires the log
+  to verify, and the latest approval of the suggestion to be by a person, signed,
+  and for the proposal now in the store. Changing the status column, or the
+  stored policy body, is refused as `APPROVAL_UNVERIFIED`. Approvals recorded
+  before this check, or before the log was signed, need `approve` again.
 - Before any write, the applier checks the kill switch, the daily cap, the
   protected-policy list, and that the live policy version is the one the proposal
   was built from. A mismatch is reported as `CONFLICT` and nothing is written.

@@ -117,7 +117,11 @@ the deterministic text.
 - Every `suggest` run expires the PENDING and APPROVED suggestions whose finding
   it did not detect, or now refuses. A finding that returns reopens its
   suggestion as PENDING, without the old approval.
-- Approve (named human) -> re-validate against current protections -> require
+- Approve (named human; the APPROVED log entry records the SHA-256 of the
+  suggestion id, evidence time and proposal) -> require the action log to verify,
+  and the latest approval to be signed, by a person, and to match the stored
+  proposal (`APPROVAL_UNVERIFIED` otherwise; rollback checks this too, since it
+  writes the stored original) -> re-validate against current protections -> require
   a detection run within `max_evidence_age_hours` -> read the live policy and
   require its version to equal the version the proposal was built from ->
   re-check the audit store since the snapshot, and expire the suggestion if the
@@ -172,7 +176,7 @@ the deterministic text.
 
 ## 10. Implementation status
 
-Implemented on `ranger_5278` and covered by unit tests (272 Python, 24 Java),
+Implemented on `ranger_5278` and covered by unit tests (279 Python, 24 Java),
 with planted-anomaly accuracy measured on synthetic data only:
 
 - read-only Ranger and Solr clients; a GET-only reader and a separate PUT-only writer

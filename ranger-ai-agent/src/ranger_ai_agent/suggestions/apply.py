@@ -19,7 +19,8 @@ Every write follows the same steps:
   1. honor the kill switch and the daily change cap; live writes also need an
      audit source and a log key (RANGER_AI_LOG_KEY), so the record is signed
   2. re-validate the proposal against current safety rules (protected policies may
-     have changed since approval)
+     have changed since approval), and require a verified action log with a
+     signed approval, by a person, of exactly this proposal (its digest)
   3. require that a detection run confirmed the finding recently (last_seen_at)
   4. read the live policy and require its version to equal the version the
      proposal was built from (optimistic concurrency; a human must re-review on conflict)
@@ -65,9 +66,10 @@ from ranger_ai_agent.suggestions.models import (
     STATUS_EXPIRED,
     STATUS_NEEDS_ATTENTION,
     Suggestion,
+    proposal_digest,
 )
 from ranger_ai_agent.suggestions.proposals import grants, validate_proposal
-from ranger_ai_agent.suggestions.store import LOG_KEY_ENV, SuggestionStore
+from ranger_ai_agent.suggestions.store import ALG_HMAC, LOG_INTACT, LOG_KEY_ENV, SuggestionStore
 
 AGENT = "agent"
 WINDOW = timedelta(hours=24)
@@ -90,6 +92,7 @@ NEEDS_ATTENTION = "NEEDS_ATTENTION"
 ABORTED = "ABORTED"
 NOTHING_TO_RECONCILE = "NOTHING_TO_RECONCILE"
 LOG_KEY_REQUIRED = "LOG_KEY_REQUIRED"
+APPROVAL_UNVERIFIED = "APPROVAL_UNVERIFIED"
 
 _NO_LOG_KEY = "live writes need a signed action log; set %s" % LOG_KEY_ENV
 
@@ -166,6 +169,11 @@ class Applier:
 
         results: List[ApplyResult] = self._recover(now)
         approved = self._store.list(STATUS_APPROVED)
+
+        log_problem = self._log_problem()
+        if log_problem:
+            # Approvals are read from the log, so nothing in it can be trusted.
+            return results + [self._note(now, s, APPROVAL_UNVERIFIED, log_problem) for s in approved]
         # Live attempts are rows in the store, so they are already in count_applications_since.
         # Dry-run plans leave no row, so they are counted here.
         planned = 0
@@ -225,6 +233,10 @@ class Applier:
 
         if not self._store.keyed and not self._safety.dry_run:
             return self._note(now, suggestion, LOG_KEY_REQUIRED, _NO_LOG_KEY)
+
+        unverified = self._approval_problem(suggestion)
+        if unverified:
+            return self._note(now, suggestion, APPROVAL_UNVERIFIED, unverified)
 
         try:
             live = self._reader.get_policy(proposal.policy_id)
@@ -314,6 +326,33 @@ class Applier:
         self._store.mark_uncertain(application_id, sid, now, AGENT, version, dict(notes, detail=detail))
         return ApplyResult(sid, NEEDS_ATTENTION, detail)
 
+    def _log_problem(self) -> Optional[str]:
+        check = self._store.check_log()
+        if check.state != LOG_INTACT:
+            return "the action log is %s (%s); nothing is written until it verifies" % (check.state, check.reason)
+        return None
+
+    def _approval_problem(self, suggestion: Suggestion) -> Optional[str]:
+        """Why the stored status and proposal are not backed by a matching approval in the log, or None.
+
+        The status column and the proposal can be edited by anyone who can write
+        the database. The approval entry in a signed log cannot be forged without
+        the key, and it records the digest of the proposal that was approved.
+        """
+        entry = self._store.approval_entry(suggestion.suggestion_id)
+        if entry is None:
+            return "no approval of the current proposal is recorded in the action log"
+        if entry["actor"].strip().lower() == AGENT:
+            return "the recorded approval was not made by a person"
+        recorded = entry["details"].get("proposal_sha256")
+        if recorded is None:
+            return "the approval was recorded before approvals were bound to proposals; run approve again"
+        if recorded != proposal_digest(suggestion):
+            return "the stored proposal is not the one that was approved"
+        if self._store.keyed and entry["hash_alg"] != ALG_HMAC:
+            return "the approval is not a signed log entry; run approve again with %s set" % LOG_KEY_ENV
+        return None
+
     def _stale_reason(self, suggestion_id: str) -> Optional[str]:
         """Why the suggestion's evidence is too old to act on, or None if it is current."""
         seen = self._store.last_seen(suggestion_id)
@@ -369,6 +408,11 @@ class Applier:
         application = self._store.open_application(suggestion_id)
         if application is None:
             return self._note(now, suggestion, REFUSED, "no active application record", actor=actor)
+
+        # Rollback writes the stored original, so it must be the one that was approved.
+        unverified = self._log_problem() or self._approval_problem(suggestion)
+        if unverified:
+            return self._note(now, suggestion, APPROVAL_UNVERIFIED, unverified, actor=actor)
 
         policy_id = application["policy_id"]
         before = suggestion.proposal.before
