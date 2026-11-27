@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -61,6 +62,24 @@ def parse_ranger_time(value: Any) -> Optional[datetime]:
     raise ValueError("unsupported timestamp: %r" % (value,))
 
 
+POLICY_TYPE_ACCESS = 0
+_MACRO_USER = re.compile(r"^\{[^{}]+\}$")
+
+
+def is_macro_user(name: str) -> bool:
+    """True for Ranger user macros such as {OWNER} and {USER}.
+
+    A macro stands for whoever matches it at request time, so it never appears
+    as the requesting user in audit records and cannot be judged by usage.
+    """
+    return bool(_MACRO_USER.match(name or ""))
+
+
+def restricts_access(raw: Dict[str, Any]) -> bool:
+    """True when the policy denies access, so disabling it would widen access."""
+    return bool(raw.get("denyPolicyItems") or raw.get("denyExceptions") or raw.get("isDenyAllElse"))
+
+
 @dataclass(frozen=True)
 class PolicyRecord:
     """The parts of a Ranger policy the detectors need."""
@@ -73,6 +92,12 @@ class PolicyRecord:
     updated: Optional[datetime]
     allow_users: Tuple[str, ...] = ()
     allow_groups: Tuple[str, ...] = ()
+    # 0 = access, 1 = data mask, 2 = row filter
+    policy_type: int = POLICY_TYPE_ACCESS
+    # Policies with audit off never produce audit events, so their usage is unknown.
+    audit_enabled: bool = True
+    # Deny items, deny exceptions or deny-all-else: disabling the policy would widen access.
+    restricts: bool = False
 
     def last_changed(self) -> Optional[datetime]:
         times = [t for t in (self.created, self.updated) if t is not None]
@@ -88,6 +113,9 @@ class PolicyRecord:
             "updated": format_utc(self.updated) if self.updated is not None else None,
             "allow_users": list(self.allow_users),
             "allow_groups": list(self.allow_groups),
+            "policy_type": self.policy_type,
+            "audit_enabled": self.audit_enabled,
+            "restricts": self.restricts,
         }
 
     @classmethod
@@ -101,6 +129,9 @@ class PolicyRecord:
             updated=parse_utc(data["updated"]) if data.get("updated") else None,
             allow_users=tuple(data.get("allow_users", [])),
             allow_groups=tuple(data.get("allow_groups", [])),
+            policy_type=int(data.get("policy_type", POLICY_TYPE_ACCESS)),
+            audit_enabled=bool(data.get("audit_enabled", True)),
+            restricts=bool(data.get("restricts", False)),
         )
 
 
@@ -128,6 +159,9 @@ def parse_policy(raw: Dict[str, Any]) -> PolicyRecord:
         updated=parse_ranger_time(raw.get("updateTime")),
         allow_users=tuple(sorted(users)),
         allow_groups=tuple(sorted(groups)),
+        policy_type=int(raw.get("policyType") or POLICY_TYPE_ACCESS),
+        audit_enabled=bool(raw.get("isAuditEnabled", True)),
+        restricts=restricts_access(raw),
     )
 
 

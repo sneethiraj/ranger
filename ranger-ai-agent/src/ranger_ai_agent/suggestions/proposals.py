@@ -18,6 +18,10 @@
 Safety rule: a proposal may only remove grants or disable a policy. It can
 never add a principal, add an access type, re-enable a policy, or change a
 policy's identity. Admin and wildcard grants therefore cannot be introduced.
+
+Each action may change exactly one field (policyItems for a removal, isEnabled
+for a disable); every other field must be identical. A policy that denies,
+masks or filters rows is never disabled, because that would widen access.
 """
 
 from __future__ import annotations
@@ -27,12 +31,16 @@ from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from ranger_ai_agent.detectors.core import Finding
 from ranger_ai_agent.detectors.rules import KIND_OVER_PRIVILEGED, KIND_STALE_POLICY
+from ranger_ai_agent.models import POLICY_TYPE_ACCESS, is_macro_user, restricts_access
 from ranger_ai_agent.suggestions.models import (
     ACTION_DISABLE_POLICY,
     ACTION_REMOVE_USER,
     ACTION_REVIEW_ONLY,
     Proposal,
 )
+
+# The only field each action may change.
+_CHANGEABLE_FIELD = {ACTION_REMOVE_USER: "policyItems", ACTION_DISABLE_POLICY: "isEnabled"}
 
 Grant = Tuple[str, str]  # (principal such as "user:alice", access type such as "select")
 
@@ -103,8 +111,9 @@ def validate_proposal(proposal: Proposal, protected_policy_ids: FrozenSet[int] =
     if proposal.before is None or proposal.after is None:
         return violations + ["proposal is missing before or after state"]
 
-    for key in ("id", "name", "service"):
-        if proposal.before.get(key) != proposal.after.get(key):
+    changeable = _CHANGEABLE_FIELD.get(proposal.action)
+    for key in sorted(set(proposal.before) | set(proposal.after)):
+        if key != changeable and proposal.before.get(key) != proposal.after.get(key):
             violations.append("proposal changes policy field %r" % key)
 
     before_grants = grants(proposal.before)
@@ -119,6 +128,8 @@ def validate_proposal(proposal: Proposal, protected_policy_ids: FrozenSet[int] =
     if proposal.action == ACTION_REMOVE_USER:
         if proposal.target_user is None:
             violations.append("removal proposal has no target user")
+        elif is_macro_user(proposal.target_user):
+            violations.append("removal proposal targets the macro %s, not a user" % proposal.target_user)
         removed = before_grants - after_grants
         if not removed:
             violations.append("removal proposal removes nothing")
@@ -131,6 +142,10 @@ def validate_proposal(proposal: Proposal, protected_policy_ids: FrozenSet[int] =
     elif proposal.action == ACTION_DISABLE_POLICY:
         if after_enabled:
             violations.append("disable proposal leaves the policy enabled")
+        if int(proposal.before.get("policyType") or POLICY_TYPE_ACCESS) != POLICY_TYPE_ACCESS:
+            violations.append("disabling a data-mask or row-filter policy would widen access")
+        if restricts_access(proposal.before):
+            violations.append("disabling a policy that denies access would widen access")
         if before_grants != after_grants:
             violations.append("disable proposal changes grants")
 

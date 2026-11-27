@@ -90,3 +90,75 @@ def test_stale_window_cannot_exceed_lookback(snap):
 def test_off_hours_must_be_valid_hours(snap):
     with pytest.raises(ValueError, match="0..23"):
         run_detectors(snap, DetectorConfig(off_hours_utc=frozenset({24})))
+
+
+# --- policies whose usage cannot be judged from allowed audit events ---
+
+from datetime import datetime, timezone  # noqa: E402
+
+from ranger_ai_agent.features.snapshot import FeatureSnapshot  # noqa: E402
+from ranger_ai_agent.models import UsageStat, is_macro_user, parse_policy  # noqa: E402
+
+_OLD = 1600000000000  # 2020-09-13, far older than stale_days
+
+
+def _raw(pid, **fields):
+    raw = {
+        "id": pid,
+        "name": "p%d" % pid,
+        "service": "hive",
+        "isEnabled": True,
+        "createTime": _OLD,
+        "updateTime": _OLD,
+        "policyItems": [{"users": ["etl"], "accesses": [{"type": "select", "isAllowed": True}]}],
+    }
+    raw.update(fields)
+    return raw
+
+
+def _snapshot(*raws):
+    snap = FeatureSnapshot(
+        as_of=datetime(2026, 11, 1, tzinfo=timezone.utc), lookback_days=90, recent_days=7, baseline_days=30
+    )
+    for raw in raws:
+        snap.policies[raw["id"]] = parse_policy(raw)
+    return snap
+
+
+def test_unused_old_access_policy_is_still_stale():
+    assert [f.policy_id for f in detect_stale_policies(_snapshot(_raw(1)), DetectorConfig())] == [1]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"policyItems": [], "denyPolicyItems": [{"users": ["mallory"], "accesses": [{"type": "select", "isAllowed": True}]}]},
+        {"denyExceptions": [{"users": ["etl"], "accesses": [{"type": "select", "isAllowed": True}]}]},
+        {"isDenyAllElse": True},
+        {"policyType": 1, "policyItems": [], "dataMaskPolicyItems": [{"users": ["bob"]}]},
+        {"policyType": 2, "policyItems": [], "rowFilterPolicyItems": [{"users": ["bob"]}]},
+        {"isAuditEnabled": False},
+    ],
+    ids=["deny-items", "deny-exceptions", "deny-all-else", "data-mask", "row-filter", "audit-off"],
+)
+def test_stale_skips_policies_that_deny_mask_filter_or_are_not_audited(fields):
+    assert detect_stale_policies(_snapshot(_raw(1, **fields)), DetectorConfig()) == []
+
+
+def test_over_privileged_skips_user_macros():
+    raw = _raw(3, policyItems=[{"users": ["{OWNER}", "{USER}", "alice", "carol"], "accesses": [{"type": "all", "isAllowed": True}]}])
+    snap = _snapshot(raw)
+    snap.policy_usage[3] = UsageStat(100, None)
+    snap.grant_usage[(3, "alice")] = UsageStat(100, None)
+    assert [f.user for f in detect_over_privileged(snap, DetectorConfig())] == ["carol"]
+
+
+def test_over_privileged_skips_policies_with_audit_off():
+    snap = _snapshot(_raw(3, isAuditEnabled=False))
+    snap.policy_usage[3] = UsageStat(100, None)
+    assert detect_over_privileged(snap, DetectorConfig()) == []
+
+
+@pytest.mark.parametrize("name,expected", [("{OWNER}", True), ("{USER}", True), ("alice", False), ("{", False), ("", False)])
+def test_is_macro_user(name, expected):
+    assert is_macro_user(name) is expected

@@ -52,14 +52,17 @@ PYTHONPATH=src python -m ranger_ai_agent.demo [--store features.db] [--seed 7]
 
 | Detector | Flags when | Confidence (heuristic) |
 |---|---|---|
-| `OVER_PRIVILEGED` | An enabled policy has at least `min_policy_events` (20) allowed events in the 90-day lookback, and a user granted it has zero allowed events through it | `0.6 + 0.3 * min(1, policy_events / 50)` |
-| `STALE_POLICY` | An enabled policy was created or changed at least 90 days ago and has no allowed events in the lookback | fixed `0.8` |
+| `OVER_PRIVILEGED` | An enabled, audited access policy has at least `min_policy_events` (20) allowed events in the 90-day lookback, and a user granted it has zero allowed events through it. User macros such as `{OWNER}` and `{USER}` are skipped | `0.6 + 0.3 * min(1, policy_events / 50)` |
+| `STALE_POLICY` | An enabled, audited access policy with no deny items, deny exceptions or deny-all-else was created or changed at least 90 days ago and has no allowed events in the lookback | fixed `0.8` |
 | `ABNORMAL_ACCESS_TIME` | Off-hours share (UTC, default 18:00-05:59) of the last 7 days is at least 0.2 above the user's 30-day baseline share, with a binomial z-score of at least 3 | `min(0.95, 0.5 + 0.1 * z)` |
 
 Limitations of the current rules:
 
 - Grants made through groups or roles are not evaluated, because group
   membership is not yet read. Only direct user grants are checked.
+- Stale detection skips deny, data-mask and row-filter policies, because
+  disabling them would widen access. It also skips policies with audit turned
+  off, because their usage cannot be seen.
 - Service and automation accounts can be flagged. Use `exclude_users` in
   `DetectorConfig` to suppress them.
 - Off-hours are defined in UTC. Per-user time zones are not modelled yet.
@@ -156,7 +159,9 @@ page shows a short error, and the details are in the Ranger Admin log. See
 - Proposals are built by deterministic code. A model can explain a finding but
   cannot change its proposal, status, or confidence.
 - Proposals may remove grants or disable a policy. They may never add grants,
-  re-enable a policy, or change a policy's identity.
+  re-enable a policy, or change a policy's identity. A removal may change only
+  `policyItems` and a disable only `isEnabled`; every other field must match.
+  A policy that denies access, masks data or filters rows is never disabled.
 - Before any write, the applier checks the kill switch, the daily cap, the
   protected-policy list, and that the live policy version is the one the proposal
   was built from. A mismatch is reported as `CONFLICT` and nothing is written.

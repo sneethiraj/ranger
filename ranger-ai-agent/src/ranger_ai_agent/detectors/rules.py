@@ -25,10 +25,19 @@ from typing import List
 
 from ranger_ai_agent.detectors.core import DetectorConfig, Finding
 from ranger_ai_agent.features.snapshot import FeatureSnapshot
+from ranger_ai_agent.models import POLICY_TYPE_ACCESS, PolicyRecord, is_macro_user
 
 KIND_OVER_PRIVILEGED = "OVER_PRIVILEGED"
 KIND_STALE_POLICY = "STALE_POLICY"
 KIND_ABNORMAL_ACCESS_TIME = "ABNORMAL_ACCESS_TIME"
+
+
+def usage_is_observable(policy: PolicyRecord) -> bool:
+    """Whether "no allowed events" really means the policy was not used.
+
+    Only access policies with audit on record allowed events against their own id.
+    """
+    return policy.policy_type == POLICY_TYPE_ACCESS and policy.audit_enabled
 
 
 def detect_over_privileged(snap: FeatureSnapshot, cfg: DetectorConfig) -> List[Finding]:
@@ -38,7 +47,7 @@ def detect_over_privileged(snap: FeatureSnapshot, cfg: DetectorConfig) -> List[F
 
     for pid in sorted(snap.policies):
         policy = snap.policies[pid]
-        if not policy.enabled or not policy.allow_users:
+        if not policy.enabled or not policy.allow_users or not usage_is_observable(policy):
             continue
 
         usage = snap.policy_usage.get(pid)
@@ -47,7 +56,8 @@ def detect_over_privileged(snap: FeatureSnapshot, cfg: DetectorConfig) -> List[F
             continue
 
         for user in policy.allow_users:
-            if user in cfg.exclude_users:
+            # Macros such as {OWNER} never appear as the requesting user in audit records.
+            if user in cfg.exclude_users or is_macro_user(user):
                 continue
             grant = snap.grant_usage.get((pid, user))
             if grant is not None and grant.count > 0:
@@ -75,13 +85,18 @@ def detect_over_privileged(snap: FeatureSnapshot, cfg: DetectorConfig) -> List[F
 
 
 def detect_stale_policies(snap: FeatureSnapshot, cfg: DetectorConfig) -> List[Finding]:
-    """An enabled policy, unchanged for a long time, with no allowed matches in the lookback."""
+    """An enabled policy, unchanged for a long time, with no allowed matches in the lookback.
+
+    Skipped, because disabling them would widen access or their usage cannot be seen:
+    deny policies (deny items, deny exceptions, deny-all-else), data-mask and
+    row-filter policies, and policies with audit turned off.
+    """
     findings: List[Finding] = []
     window = snap.lookback_days
 
     for pid in sorted(snap.policies):
         policy = snap.policies[pid]
-        if not policy.enabled:
+        if not policy.enabled or policy.restricts or not usage_is_observable(policy):
             continue
 
         last_changed = policy.last_changed()

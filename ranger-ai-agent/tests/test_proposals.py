@@ -132,3 +132,60 @@ def test_remove_user_drops_empty_items_but_keeps_groups():
 def test_grants_ignore_denied_accesses():
     raw = {"policyItems": [{"users": ["a"], "accesses": [{"type": "select", "isAllowed": False}, {"type": "update"}]}]}
     assert grants(raw) == {("user:a", "update")}
+
+
+# --- disabling or editing must never widen access ---
+
+import pytest  # noqa: E402
+
+
+def _stale_proposal_with(**fields):
+    proposal = _proposal_for("STALE_POLICY")
+    before = copy.deepcopy(proposal.before)
+    before.update(fields)
+    after = copy.deepcopy(before)
+    after["isEnabled"] = False
+    return replace(proposal, before=before, after=after)
+
+
+@pytest.mark.parametrize(
+    "fields,message",
+    [
+        ({"denyPolicyItems": [{"users": ["mallory"], "accesses": [{"type": "select", "isAllowed": True}]}]}, "denies"),
+        ({"denyExceptions": [{"users": ["carol"], "accesses": [{"type": "select", "isAllowed": True}]}]}, "denies"),
+        ({"isDenyAllElse": True}, "denies"),
+        ({"policyType": 1}, "data-mask"),
+        ({"policyType": 2}, "row-filter"),
+    ],
+)
+def test_validator_refuses_to_disable_a_restricting_policy(fields, message):
+    violations = validate_proposal(_stale_proposal_with(**fields))
+    assert any(message in v and "widen access" in v for v in violations)
+
+
+def test_validator_allows_disabling_a_plain_access_policy_with_empty_deny_lists():
+    assert validate_proposal(_stale_proposal_with(denyPolicyItems=[], denyExceptions=[], isDenyAllElse=False)) == []
+
+
+@pytest.mark.parametrize("field,value", [("denyPolicyItems", [{"users": ["x"]}]), ("resources", {}), ("isDenyAllElse", True), ("policyType", 1)])
+def test_validator_rejects_removal_that_changes_any_other_field(field, value):
+    proposal = _proposal_for("OVER_PRIVILEGED")
+    tampered = copy.deepcopy(proposal.after)
+    tampered[field] = value
+    violations = validate_proposal(replace(proposal, after=tampered))
+    assert "proposal changes policy field %r" % field in violations
+
+
+def test_validator_rejects_disable_that_also_drops_deny_items():
+    proposal = _stale_proposal_with(denyPolicyItems=[])
+    tampered = copy.deepcopy(proposal.after)
+    tampered["denyPolicyItems"] = [{"users": ["x"]}]
+    assert "proposal changes policy field 'denyPolicyItems'" in validate_proposal(replace(proposal, after=tampered))
+
+
+def test_validator_refuses_to_remove_a_macro():
+    proposal = _proposal_for("OVER_PRIVILEGED")
+    before = copy.deepcopy(proposal.before)
+    before["policyItems"][0]["users"].append("{OWNER}")
+    macro = replace(proposal, target_user="{OWNER}", before=before, after=remove_user(before, "{OWNER}"))
+    assert any("macro" in v for v in validate_proposal(macro))

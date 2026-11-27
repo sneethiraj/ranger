@@ -118,6 +118,8 @@ the formula is documented and unit tested.
   changed since the agent wrote it, and it is blocked while the kill switch is on.
 - Safeguards: dry-run default, kill switch, rolling 24-hour change cap, protected
   policy list, and no added grants (so no admin or wildcard grants can be introduced).
+  Each action may change one field only, and deny, data-mask and row-filter
+  policies are never disabled, since that would widen access.
 - A failed read-back after a write is reported as `VERIFY_FAILED`. The policy is
   left as written, and a person must inspect it. The next run reports `CONFLICT`
   because the version has moved.
@@ -143,7 +145,7 @@ the formula is documented and unit tested.
 
 ## 10. Implementation status
 
-Implemented on `ranger_5278` and covered by unit tests (181 Python, 24 Java),
+Implemented on `ranger_5278` and covered by unit tests (209 Python, 24 Java),
 with planted-anomaly accuracy measured on synthetic data only:
 
 - read-only Ranger and Solr clients; a GET-only reader and a separate PUT-only writer

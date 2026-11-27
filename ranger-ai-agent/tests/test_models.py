@@ -70,3 +70,16 @@ def test_policy_record_round_trip():
         allow_groups=("g",),
     )
     assert PolicyRecord.from_dict(policy.to_dict()) == policy
+
+
+def test_parse_policy_records_type_audit_and_deny_flags():
+    raw = {"id": 4, "policyType": 1, "isAuditEnabled": False, "denyPolicyItems": [{"users": ["x"]}]}
+    policy = parse_policy(raw)
+    assert (policy.policy_type, policy.audit_enabled, policy.restricts) == (1, False, True)
+    assert PolicyRecord.from_dict(policy.to_dict()) == policy
+
+
+def test_policy_record_from_older_stored_dict_uses_defaults():
+    old = {"policy_id": 1, "name": "x", "service": "s", "enabled": True, "created": None, "updated": None}
+    policy = PolicyRecord.from_dict(old)
+    assert (policy.policy_type, policy.audit_enabled, policy.restricts) == (0, True, False)
